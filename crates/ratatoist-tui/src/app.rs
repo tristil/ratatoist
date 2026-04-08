@@ -258,6 +258,26 @@ impl TaskForm {
     }
 }
 
+/// Build the `item_add` sync command args from a completed task form.
+///
+/// The Todoist Sync API takes a `due` object (`{ "string": "tomorrow" }`), not
+/// the REST API's top-level `due_string` shorthand — sending `due_string` at
+/// the top level is silently dropped by the server, which is how the add-task
+/// modal was losing the date the user typed in.
+pub(crate) fn build_item_add_args(form: &TaskForm, project_id: &str) -> serde_json::Value {
+    let mut args = serde_json::json!({
+        "content": form.content,
+        "project_id": project_id,
+    });
+    if !form.due_string.is_empty() {
+        args["due"] = serde_json::json!({ "string": form.due_string });
+    }
+    if form.priority > 1 {
+        args["priority"] = serde_json::Value::Number(serde_json::Number::from(form.priority));
+    }
+    args
+}
+
 // Tracks what was in local state before an optimistic mutation so we can
 // revert if the server rejects the command.
 pub enum OptimisticOp {
@@ -1312,16 +1332,7 @@ impl App {
             },
         );
 
-        let mut args = serde_json::json!({
-            "content": form.content,
-            "project_id": project_id,
-        });
-        if !form.due_string.is_empty() {
-            args["due_string"] = serde_json::Value::String(form.due_string);
-        }
-        if form.priority > 1 {
-            args["priority"] = serde_json::Value::Number(serde_json::Number::from(form.priority));
-        }
+        let args = build_item_add_args(&form, &project_id);
 
         self.pending_commands.push(SyncCommand {
             r#type: "item_add".to_string(),
@@ -1396,8 +1407,9 @@ impl App {
             }
             2 => {
                 // Due string: server parses and returns the Due object — no
-                // optimistic update possible here.
-                serde_json::json!({ "id": task_id, "due_string": value })
+                // optimistic update possible here. Sync API takes a `due`
+                // object, not the REST-style `due_string` shorthand.
+                serde_json::json!({ "id": task_id, "due": { "string": value } })
             }
             3 => {
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
@@ -2246,5 +2258,118 @@ async fn run_websocket(url: String, tx: mpsc::Sender<BgResult>) {
         }
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(60);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn test_app() -> App {
+        let client = TodoistClient::new("test_token").expect("client");
+        App::new(client, false, true)
+    }
+
+    /// Dispatch a key event through the same routing the main loop uses.
+    fn press(app: &mut App, code: KeyCode) {
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        match keys::handle_key(app, key) {
+            KeyAction::StartInput => app.start_input(),
+            KeyAction::SubmitInput => app.submit_input(),
+            KeyAction::SubmitForm => app.submit_task_form(),
+            KeyAction::FormFieldUp => app.form_field_up(),
+            KeyAction::FormFieldDown => app.form_field_down(),
+            KeyAction::FormEditField => app.form_edit_field(),
+            KeyAction::FormEscNormal => app.submit_input(),
+            KeyAction::CancelInput => app.cancel_input(),
+            KeyAction::Consumed | KeyAction::None => {}
+            _ => panic!("unexpected key action in test"),
+        }
+    }
+
+    /// Regression: editing the Due date field inside the add-task modal should
+    /// persist the typed value into `form.due_string` so that
+    /// `submit_task_form` sends it as `due_string` in the `item_add` command.
+    #[test]
+    fn add_modal_updates_due_date() {
+        let mut app = test_app();
+
+        // Open the add modal (equivalent to pressing `a` on the task list).
+        app.active_pane = Pane::Tasks;
+        press(&mut app, KeyCode::Char('a'));
+        let form = app.task_form.as_ref().expect("form opens");
+        assert_eq!(form.active_field, 0);
+        assert!(form.editing, "new form starts editing content");
+
+        // Type "Buy milk" and Enter to commit the content field.
+        for c in "Buy milk".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        let form = app.task_form.as_ref().unwrap();
+        assert_eq!(form.content, "Buy milk");
+        assert!(!form.editing);
+
+        // j, j → Due date (field 2).
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.task_form.as_ref().unwrap().active_field, 2);
+
+        // Enter edit mode on the Due date field.
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.task_form.as_ref().unwrap().editing,
+            "Enter on Due date should enter editing mode"
+        );
+
+        // Type "tomorrow" and Enter.
+        for c in "tomorrow".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        let form = app.task_form.as_ref().unwrap();
+        assert_eq!(
+            form.due_string, "tomorrow",
+            "Due date should be saved into the form after editing"
+        );
+        assert!(!form.editing);
+    }
+
+    /// The Todoist Sync API needs a `due` object; the previous code sent
+    /// `due_string` at the top level, which the server silently ignored — the
+    /// task was created but without the date the user typed.
+    #[test]
+    fn item_add_args_use_due_object_for_sync_api() {
+        let mut form = TaskForm::new("project_1".to_string());
+        form.content = "Buy milk".to_string();
+        form.due_string = "tomorrow".to_string();
+
+        let args = build_item_add_args(&form, "project_1");
+
+        assert_eq!(args["content"], "Buy milk");
+        assert_eq!(args["project_id"], "project_1");
+        assert_eq!(
+            args["due"],
+            serde_json::json!({ "string": "tomorrow" }),
+            "Sync API expects a `due` object, not top-level `due_string`"
+        );
+        assert!(
+            args.get("due_string").is_none(),
+            "top-level `due_string` is REST-API-only and must not be sent"
+        );
+    }
+
+    #[test]
+    fn item_add_args_omits_due_when_empty() {
+        let mut form = TaskForm::new("project_1".to_string());
+        form.content = "Buy milk".to_string();
+
+        let args = build_item_add_args(&form, "project_1");
+
+        assert!(args.get("due").is_none());
+        assert!(args.get("due_string").is_none());
     }
 }

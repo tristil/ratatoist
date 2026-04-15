@@ -14,12 +14,14 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         ProjectEntry::Project(i) => {
             !app.today_view_active
                 && !app.upcoming_view_active
+                && !app.github_prs_view_active
                 && app.folder_cursor.is_none()
                 && *i == app.selected_project
         }
         ProjectEntry::FolderHeader(fi) => app.folder_cursor == Some(*fi),
         ProjectEntry::TodayView => app.today_view_active && app.folder_cursor.is_none(),
         ProjectEntry::UpcomingView => app.upcoming_view_active && app.folder_cursor.is_none(),
+        ProjectEntry::GithubPrsView => app.github_prs_view_active && app.folder_cursor.is_none(),
         _ => false,
     });
 
@@ -81,6 +83,19 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
                     Span::raw("  "),
                     Span::styled("▦ ", Style::default().fg(Color::Cyan)),
                     Span::styled("Upcoming", theme.normal_text()),
+                ];
+                if count > 0 {
+                    spans.push(Span::styled(format!("  {count}"), theme.muted_text()));
+                }
+                ListItem::new(Line::from(spans))
+            }
+
+            ProjectEntry::GithubPrsView => {
+                let count = app.github_prs.len();
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled("⑃ ", Style::default().fg(Color::Magenta)),
+                    Span::styled("Pull Requests", theme.normal_text()),
                 ];
                 if count > 0 {
                     spans.push(Span::styled(format!("  {count}"), theme.muted_text()));

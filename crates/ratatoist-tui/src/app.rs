@@ -310,6 +310,7 @@ pub enum ProjectEntry {
     Separator,
     TodayView,
     UpcomingView,
+    GithubPrsView,
 }
 
 pub enum ProjectNavItem {
@@ -317,6 +318,20 @@ pub enum ProjectNavItem {
     Project(usize),
     TodayView,
     UpcomingView,
+    GithubPrsView,
+}
+
+/// A pull request row as returned by `gh search prs --json ...`. Subset of the
+/// gh schema — only what we render.
+#[derive(Debug, Clone)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub repo_full_name: String,
+    pub author_login: String,
+    pub updated_at: String,
+    pub is_draft: bool,
 }
 
 
@@ -330,6 +345,7 @@ enum BgResult {
     WebSocketConnected,
     WebSocketEvent,
     WebSocketDisconnected,
+    GithubPrsFetched(Result<Vec<PullRequest>>),
     Comments {
         task_id: String,
         comments: Result<Vec<Comment>>,
@@ -387,6 +403,12 @@ pub struct App {
     pub current_user_name: Option<String>,
     pub today_view_active: bool,
     pub upcoming_view_active: bool,
+    pub github_prs_view_active: bool,
+    pub github_prs: Vec<PullRequest>,
+    pub github_prs_loading: bool,
+    pub github_prs_error: Option<String>,
+    pub github_prs_fetched_at: Option<chrono::DateTime<Local>>,
+    pub selected_pr: usize,
     pub overdue_section_collapsed: bool,
     last_activity: Instant,
     pending_ws_sync: bool,
@@ -560,6 +582,12 @@ impl App {
             current_user_name: None,
             today_view_active: false,
             upcoming_view_active: false,
+            github_prs_view_active: false,
+            github_prs: Vec::new(),
+            github_prs_loading: false,
+            github_prs_error: None,
+            github_prs_fetched_at: None,
+            selected_pr: 0,
             overdue_section_collapsed: false,
             last_activity: Instant::now(),
             pending_ws_sync: false,
@@ -661,6 +689,9 @@ impl App {
                     KeyAction::ProjectChanged => self.switch_to_project_tasks(),
                     KeyAction::TodayViewSelected => self.activate_today_view(),
                     KeyAction::UpcomingViewSelected => self.activate_upcoming_view(),
+                    KeyAction::GithubPrsViewSelected => self.activate_github_prs_view(),
+                    KeyAction::RefreshGithubPrs => self.refresh_github_prs(),
+                    KeyAction::OpenSelectedPrInBrowser => self.open_selected_pr_in_browser(),
                     KeyAction::ToggleOverdueSection => self.toggle_overdue_section(),
                     KeyAction::OpenDetail => self.open_detail(),
                     KeyAction::CloseDetail => {
@@ -1086,6 +1117,24 @@ impl App {
                     self.websocket_connected = false;
                 }
 
+                BgResult::GithubPrsFetched(result) => {
+                    self.github_prs_loading = false;
+                    self.github_prs_fetched_at = Some(Local::now());
+                    match result {
+                        Ok(prs) => {
+                            self.github_prs = prs;
+                            self.selected_pr = self
+                                .selected_pr
+                                .min(self.github_prs.len().saturating_sub(1));
+                            self.github_prs_error = None;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "github PR fetch failed");
+                            self.github_prs_error = Some(e.to_string());
+                        }
+                    }
+                }
+
                 BgResult::Comments {
                     task_id,
                     comments,
@@ -1174,6 +1223,7 @@ impl App {
     fn switch_to_project_tasks(&mut self) {
         self.today_view_active = false;
         self.upcoming_view_active = false;
+        self.github_prs_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
     }
@@ -1182,6 +1232,7 @@ impl App {
         tracing::debug!("today view activated");
         self.today_view_active = true;
         self.upcoming_view_active = false;
+        self.github_prs_view_active = false;
         self.overdue_section_collapsed = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
@@ -1209,8 +1260,52 @@ impl App {
         tracing::debug!("upcoming view activated");
         self.today_view_active = false;
         self.upcoming_view_active = true;
+        self.github_prs_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
+    }
+
+    pub fn activate_github_prs_view(&mut self) {
+        tracing::debug!("github PRs view activated");
+        self.today_view_active = false;
+        self.upcoming_view_active = false;
+        self.github_prs_view_active = true;
+        self.selected_pr = 0;
+        self.spawn_github_prs_fetch();
+    }
+
+    pub fn open_selected_pr_in_browser(&mut self) {
+        let Some(pr) = self.github_prs.get(self.selected_pr) else {
+            return;
+        };
+        let url = pr.url.clone();
+        // `gh pr view <url> --web` opens the PR in the default browser without
+        // requiring us to know the OS-specific `open` / `xdg-open` command.
+        tokio::spawn(async move {
+            let _ = tokio::process::Command::new("gh")
+                .args(["pr", "view", &url, "--web"])
+                .status()
+                .await;
+        });
+    }
+
+    pub fn refresh_github_prs(&mut self) {
+        if self.github_prs_view_active {
+            self.spawn_github_prs_fetch();
+        }
+    }
+
+    fn spawn_github_prs_fetch(&mut self) {
+        if self.github_prs_loading {
+            return;
+        }
+        self.github_prs_loading = true;
+        self.github_prs_error = None;
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = fetch_github_prs().await;
+            let _ = tx.send(BgResult::GithubPrsFetched(result)).await;
+        });
     }
 
     pub fn toggle_overdue_section(&mut self) {
@@ -1725,6 +1820,7 @@ impl App {
                 if is_inbox {
                     entries.push(ProjectEntry::TodayView);
                     entries.push(ProjectEntry::UpcomingView);
+                    entries.push(ProjectEntry::GithubPrsView);
                 }
             }
         }
@@ -1763,6 +1859,7 @@ impl App {
                 ProjectEntry::Project(i) => Some(ProjectNavItem::Project(i)),
                 ProjectEntry::TodayView => Some(ProjectNavItem::TodayView),
                 ProjectEntry::UpcomingView => Some(ProjectNavItem::UpcomingView),
+                ProjectEntry::GithubPrsView => Some(ProjectNavItem::GithubPrsView),
                 _ => None,
             })
             .collect()
@@ -1935,6 +2032,9 @@ impl App {
         }
         if self.upcoming_view_active {
             return "Upcoming";
+        }
+        if self.github_prs_view_active {
+            return "Pull Requests";
         }
         self.projects
             .get(self.selected_project)
@@ -2338,6 +2438,64 @@ fn collect_project_subtree(parent_id: Option<&str>, all: &[Project], out: &mut V
     }
 }
 
+/// Shell out to `gh search prs --author @me --state open --json ...` and parse
+/// the JSON array into `PullRequest` records. Errors surface either as the
+/// non-zero-exit stderr from `gh` or a JSON parse failure.
+async fn fetch_github_prs() -> Result<Vec<PullRequest>> {
+    use tokio::process::Command;
+
+    let output = Command::new("gh")
+        .args([
+            "search",
+            "prs",
+            "--author",
+            "@me",
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,url,repository,author,updatedAt,isDraft",
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to invoke gh: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if stderr.is_empty() {
+            format!("gh exited with status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(anyhow::anyhow!("{msg}"));
+    }
+
+    let raw: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("gh JSON parse error: {e}"))?;
+
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("expected JSON array from gh"))?;
+
+    let mut prs = Vec::with_capacity(arr.len());
+    for item in arr {
+        prs.push(PullRequest {
+            number: item["number"].as_u64().unwrap_or(0),
+            title: item["title"].as_str().unwrap_or("").to_string(),
+            url: item["url"].as_str().unwrap_or("").to_string(),
+            repo_full_name: item["repository"]["nameWithOwner"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            author_login: item["author"]["login"].as_str().unwrap_or("").to_string(),
+            updated_at: item["updatedAt"].as_str().unwrap_or("").to_string(),
+            is_draft: item["isDraft"].as_bool().unwrap_or(false),
+        });
+    }
+    Ok(prs)
+}
+
 async fn run_websocket(url: String, tx: mpsc::Sender<BgResult>) {
     use futures_util::StreamExt;
     use tokio_tungstenite::connect_async_tls_with_config;
@@ -2686,6 +2844,25 @@ mod tests {
         app.activate_upcoming_view();
         assert!(app.upcoming_view_active);
         assert!(!app.today_view_active);
+    }
+
+    /// Switching among virtual views keeps them mutually exclusive.
+    #[tokio::test]
+    async fn github_prs_view_is_mutually_exclusive_with_today_and_upcoming() {
+        let mut app = test_app();
+        app.activate_today_view();
+        app.activate_github_prs_view();
+        assert!(app.github_prs_view_active);
+        assert!(!app.today_view_active);
+        assert!(!app.upcoming_view_active);
+        assert!(
+            app.github_prs_loading,
+            "activation should kick off a fetch"
+        );
+
+        app.activate_upcoming_view();
+        assert!(app.upcoming_view_active);
+        assert!(!app.github_prs_view_active);
     }
 
     #[test]

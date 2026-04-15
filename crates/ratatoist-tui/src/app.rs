@@ -1188,6 +1188,15 @@ impl App {
     }
 
     fn complete_selected_task(&mut self) {
+        self.enqueue_complete_selected();
+        self.flush_commands();
+    }
+
+    /// Enqueue the complete/reopen command for the selected task and apply
+    /// the optimistic UI update. Split out so tests can inspect the enqueued
+    /// command without flushing (which spawns a tokio task and drains the
+    /// pending queue).
+    fn enqueue_complete_selected(&mut self) {
         let (task_id, was_checked, is_recurring) = {
             let visible = self.visible_tasks();
             let Some(task) = visible.get(self.selected_task) else {
@@ -1201,7 +1210,16 @@ impl App {
         };
 
         let before = self.tasks.iter().find(|t| t.id == task_id).cloned();
-        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+
+        // For recurring tasks, completing advances the series to the next
+        // occurrence — the task should stay in the list with a new due date,
+        // not disappear. Skip the optimistic `checked` flip and let the sync
+        // response deliver the advanced due date. Non-recurring complete and
+        // any reopen still flip optimistically for instant feedback.
+        let completing_recurring = !was_checked && is_recurring;
+        if !completing_recurring
+            && let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id)
+        {
             t.checked = !was_checked;
         }
 
@@ -1236,8 +1254,6 @@ impl App {
                 },
             );
         }
-
-        self.flush_commands();
     }
 
     fn start_input(&mut self) {
@@ -2434,5 +2450,81 @@ mod tests {
         let form = app.task_form.as_ref().expect("form opens");
         assert_eq!(form.due_string, "");
         assert_eq!(form.project_id, "proj_1");
+    }
+
+    use ratatoist_core::api::models::Due;
+
+    fn pending_cmd_types(app: &App) -> Vec<String> {
+        app.pending_commands
+            .iter()
+            .map(|c| c.r#type.clone())
+            .collect()
+    }
+
+    /// Completing a recurring task must not flip it to checked optimistically —
+    /// the server will advance the due date and the task should remain on the
+    /// list. Hiding it makes it look like the whole recurring series was
+    /// deleted.
+    #[test]
+    fn complete_recurring_keeps_task_visible_and_sends_item_complete() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.tasks.push(Task {
+            id: "t_rec".to_string(),
+            content: "Stand-up".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: "2026-04-15".to_string(),
+                is_recurring: true,
+                string: Some("every weekday".to_string()),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.active_pane = Pane::Tasks;
+        app.selected_task = 0;
+
+        app.enqueue_complete_selected();
+
+        // Still unchecked — server will advance the due date.
+        assert!(
+            !app.tasks[0].checked,
+            "recurring task must stay unchecked after optimistic complete"
+        );
+        assert_eq!(pending_cmd_types(&app), vec!["item_complete".to_string()]);
+    }
+
+    /// Completing a non-recurring task flips to checked immediately for
+    /// instant UI feedback, and sends item_close.
+    #[test]
+    fn complete_nonrecurring_flips_checked_and_sends_item_close() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.tasks.push(Task {
+            id: "t_once".to_string(),
+            content: "Write memo".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: "2026-04-15".to_string(),
+                is_recurring: false,
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.active_pane = Pane::Tasks;
+        app.selected_task = 0;
+
+        app.enqueue_complete_selected();
+
+        assert!(app.tasks[0].checked);
+        assert_eq!(pending_cmd_types(&app), vec!["item_close".to_string()]);
     }
 }

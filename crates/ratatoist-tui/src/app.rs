@@ -1279,11 +1279,16 @@ impl App {
             return;
         };
         let url = pr.url.clone();
-        // `gh pr view <url> --web` opens the PR in the default browser without
-        // requiring us to know the OS-specific `open` / `xdg-open` command.
+        // `gh pr view <url> --web` opens the PR in the default browser. gh
+        // prints "Opening <url>..." to stderr and occasionally an update
+        // notice ("A new release of gh is available..."). Both would bleed
+        // into the TUI, so we redirect both streams to the null device.
         tokio::spawn(async move {
             let _ = tokio::process::Command::new("gh")
                 .args(["pr", "view", &url, "--web"])
+                .env("GH_NO_UPDATE_NOTIFIER", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status()
                 .await;
         });
@@ -2457,6 +2462,7 @@ async fn fetch_github_prs() -> Result<Vec<PullRequest>> {
             "--json",
             "number,title,url,repository,author,updatedAt,isDraft",
         ])
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("failed to invoke gh: {e}"))?;

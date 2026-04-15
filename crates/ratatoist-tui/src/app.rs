@@ -416,6 +416,12 @@ pub struct App {
     websocket_url: Option<String>,
     pending_commands: Vec<SyncCommand>,
     temp_id_pending: HashMap<String, OptimisticOp>,
+    /// Task IDs for recurring completes whose sync response hasn't arrived
+    /// yet. We filter these out of visible_tasks so the user sees them
+    /// disappear from Today instantly (like non-recurring completes do)
+    /// instead of waiting for the server round-trip. Prevents double-tap `x`
+    /// from advancing the series twice.
+    pending_close_recurring: HashSet<String>,
     bg_tx: mpsc::Sender<BgResult>,
     bg_rx: mpsc::Receiver<BgResult>,
     client: Arc<TodoistClient>,
@@ -595,6 +601,7 @@ impl App {
             websocket_url: None,
             pending_commands: Vec::new(),
             temp_id_pending: HashMap::new(),
+            pending_close_recurring: HashSet::new(),
             bg_tx,
             bg_rx,
             client: Arc::new(client),
@@ -1056,6 +1063,9 @@ impl App {
                     for (uuid, status) in &resp.sync_status {
                         if status.is_err() {
                             if let Some(op) = self.temp_id_pending.remove(uuid) {
+                                if let OptimisticOp::TaskUpdated { task_id, .. } = &op {
+                                    self.pending_close_recurring.remove(task_id);
+                                }
                                 self.revert_optimistic(op);
                             }
                             let msg = status
@@ -1069,12 +1079,23 @@ impl App {
                                 suggestion: None,
                                 recoverable: true,
                             });
-                        } else if let Some(op) = self.temp_id_pending.remove(uuid)
-                            && let OptimisticOp::CommentAdded { task_id, .. } = &op
-                        {
-                            let current = self.selected_task().map(|t| t.id.clone());
-                            if current.as_deref() == Some(task_id.as_str()) {
-                                refresh_comments_for = Some(task_id.clone());
+                        } else if let Some(op) = self.temp_id_pending.remove(uuid) {
+                            match &op {
+                                OptimisticOp::CommentAdded { task_id, .. } => {
+                                    let current = self.selected_task().map(|t| t.id.clone());
+                                    if current.as_deref() == Some(task_id.as_str()) {
+                                        refresh_comments_for = Some(task_id.clone());
+                                    }
+                                }
+                                OptimisticOp::TaskUpdated { task_id, .. } => {
+                                    // Recurring close landed: the items delta
+                                    // in this same response carries the new
+                                    // due date, so we can drop the pending
+                                    // placeholder and let the task reappear
+                                    // (now under tomorrow in Upcoming).
+                                    self.pending_close_recurring.remove(task_id);
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -1351,9 +1372,12 @@ impl App {
         // response deliver the advanced due date. Non-recurring complete and
         // any reopen still flip optimistically for instant feedback.
         let completing_recurring = !was_checked && is_recurring;
-        if !completing_recurring
-            && let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id)
-        {
+        if completing_recurring {
+            // Hide from the visible list immediately; server will deliver the
+            // advanced due date shortly. Prevents the user double-tapping `x`
+            // and advancing the recurrence by two.
+            self.pending_close_recurring.insert(task_id.clone());
+        } else if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
             t.checked = !was_checked;
         }
 
@@ -2119,6 +2143,9 @@ impl App {
                     if t.is_deleted || t.checked || t.parent_id.is_some() {
                         return false;
                     }
+                    if self.pending_close_recurring.contains(&t.id) {
+                        return false;
+                    }
                     let is_today_or_overdue = t
                         .due
                         .as_ref()
@@ -2158,6 +2185,9 @@ impl App {
                 .iter()
                 .filter(|t| {
                     if t.is_deleted || t.checked || t.parent_id.is_some() {
+                        return false;
+                    }
+                    if self.pending_close_recurring.contains(&t.id) {
                         return false;
                     }
                     if t.due.is_none() {
@@ -2711,6 +2741,59 @@ mod tests {
             .iter()
             .map(|c| c.r#type.clone())
             .collect()
+    }
+
+    /// Completing a recurring task in the Today view hides it immediately
+    /// (optimistic), so a double-tap of `x` doesn't advance the series twice.
+    /// The underlying `checked` field stays false; the hide is via the
+    /// pending_close_recurring set.
+    #[test]
+    fn completing_recurring_in_today_hides_optimistically() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.tasks.push(Task {
+            id: "rec".to_string(),
+            content: "Brush teeth".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                is_recurring: true,
+                string: Some("every day".to_string()),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.tasks.push(Task {
+            id: "other".to_string(),
+            content: "Take pills".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                is_recurring: true,
+                string: Some("every day".to_string()),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.activate_today_view();
+        app.active_pane = Pane::Tasks;
+        app.selected_task = 0;
+        assert_eq!(app.visible_tasks().len(), 2);
+
+        app.enqueue_complete_selected();
+
+        // Brush teeth should be gone from the visible list even though its
+        // `checked` field is still false (server hasn't advanced the date).
+        let visible_ids: Vec<&str> =
+            app.visible_tasks().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(visible_ids, vec!["other"], "Brush teeth hides immediately");
+        assert!(!app.tasks.iter().find(|t| t.id == "rec").unwrap().checked);
+        assert!(app.pending_close_recurring.contains("rec"));
+        assert_eq!(pending_cmd_types(&app), vec!["item_close".to_string()]);
     }
 
     /// Completing a recurring task must not flip it to checked optimistically —

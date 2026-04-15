@@ -1228,12 +1228,11 @@ impl App {
             self.selected_task = new_len - 1;
         }
 
-        // item_close mimics the Todoist UI: recurring tasks advance to the
-        // next occurrence, non-recurring tasks close normally. item_complete
-        // (which we previously sent for recurring) actually marks the whole
-        // series done — the opposite of what we want.
         let cmd_type = if was_checked {
             "item_reopen"
+        } else if is_recurring {
+            // item_complete advances the series; item_close would end it.
+            "item_complete"
         } else {
             "item_close"
         };
@@ -2467,7 +2466,7 @@ mod tests {
     /// list. Hiding it makes it look like the whole recurring series was
     /// deleted.
     #[test]
-    fn complete_recurring_keeps_task_visible_and_sends_item_close() {
+    fn complete_recurring_keeps_task_visible_and_sends_item_complete() {
         let mut app = test_app();
         app.projects.push(Project {
             id: "p1".to_string(),
@@ -2496,7 +2495,7 @@ mod tests {
             !app.tasks[0].checked,
             "recurring task must stay unchecked after optimistic complete"
         );
-        assert_eq!(pending_cmd_types(&app), vec!["item_close".to_string()]);
+        assert_eq!(pending_cmd_types(&app), vec!["item_complete".to_string()]);
     }
 
     /// Completing a non-recurring task flips to checked immediately for

@@ -11,6 +11,7 @@ A terminal UI client for Todoist. Lets users manage their tasks without leaving 
 ## Navigation
 
 - Sidebar shows workspaces, folders, and projects hierarchically; favorites pinned at top.
+- Virtual views: Today (overdue + due today) and Upcoming (all scheduled tasks, grouped by day) appear below Inbox.
 - Dual input modes: Vim (`j`/`k`/`h`/`l`, Normal/Insert/Visual) and Standard (arrow keys).
 - Task list with foldable subtask trees.
 - Detail pane with scrollable content, comments, and inline field editing.

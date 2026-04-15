@@ -39,6 +39,7 @@ pub enum KeyAction {
     SelectTheme,
     CloseThemePicker,
     TodayViewSelected,
+    UpcomingViewSelected,
     ToggleOverdueSection,
     Consumed,
     None,
@@ -554,6 +555,9 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                     ProjectNavItem::TodayView => {
                         app.today_view_active && app.folder_cursor.is_none()
                     }
+                    ProjectNavItem::UpcomingView => {
+                        app.upcoming_view_active && app.folder_cursor.is_none()
+                    }
                 })
                 .unwrap_or(0) as i32;
             let next_pos = pos + delta;
@@ -578,6 +582,10 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                 ProjectNavItem::TodayView => {
                     app.folder_cursor = None;
                     KeyAction::TodayViewSelected
+                }
+                ProjectNavItem::UpcomingView => {
+                    app.folder_cursor = None;
+                    KeyAction::UpcomingViewSelected
                 }
             }
         }
@@ -623,6 +631,10 @@ fn jump_to_edge(app: &mut App, top: bool) -> KeyAction {
                 Some(ProjectNavItem::TodayView) => {
                     app.folder_cursor = None;
                     return KeyAction::TodayViewSelected;
+                }
+                Some(ProjectNavItem::UpcomingView) => {
+                    app.folder_cursor = None;
+                    return KeyAction::UpcomingViewSelected;
                 }
                 None => {}
             }

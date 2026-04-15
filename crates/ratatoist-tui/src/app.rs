@@ -2031,6 +2031,13 @@ impl App {
         }
     }
 
+    /// True when any virtual view (Today / Upcoming / Pull Requests) is
+    /// currently active and the underlying `selected_project` should be
+    /// ignored for display, navigation, or add-task defaults.
+    pub fn on_virtual_view(&self) -> bool {
+        self.today_view_active || self.upcoming_view_active || self.github_prs_view_active
+    }
+
     pub fn selected_project_name(&self) -> &str {
         if self.today_view_active {
             return "Today";

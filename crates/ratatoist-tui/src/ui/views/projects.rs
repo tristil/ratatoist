@@ -12,9 +12,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
 
     let selected_visual = entries.iter().position(|e| match e {
         ProjectEntry::Project(i) => {
-            !app.today_view_active
-                && !app.upcoming_view_active
-                && !app.github_prs_view_active
+            !app.on_virtual_view()
                 && app.folder_cursor.is_none()
                 && *i == app.selected_project
         }

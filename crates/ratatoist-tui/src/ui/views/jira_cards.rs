@@ -63,6 +63,16 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         return;
     }
 
+    // Pad the key column to the widest key + 2 spaces so summaries line up
+    // regardless of key length (BUNDLE-667 vs BUNDLE-30485).
+    let key_col_width = app
+        .jira_cards
+        .iter()
+        .map(|c| c.key.len())
+        .max()
+        .unwrap_or(10)
+        + 2;
+
     let mut items: Vec<ListItem> = Vec::new();
     let mut current_project: Option<String> = None;
     let mut visual_selected: Option<usize> = None;
@@ -85,7 +95,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
             theme.muted_text(),
         ));
         spans.push(Span::styled(
-            format!("{:<10}", card.key),
+            format!("{:<width$}", card.key, width = key_col_width),
             theme.key_hint(),
         ));
         spans.push(Span::styled(&card.summary, theme.normal_text()));

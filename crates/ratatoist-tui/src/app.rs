@@ -443,6 +443,9 @@ pub struct App {
     pub github_prs_fetched_at: Option<chrono::DateTime<Local>>,
     pub selected_pr: usize,
     pub gh_available: bool,
+    /// Owners hidden from the PR sidebar by the user via `h`. Persisted in
+    /// `ui_settings.json`.
+    pub hidden_pr_orgs: HashSet<String>,
     pub jira_cards_view_active: bool,
     pub jira_cards: Vec<JiraCard>,
     pub jira_cards_loading: bool,
@@ -478,6 +481,24 @@ fn load_theme_idx(themes: &[crate::ui::theme::Theme]) -> usize {
         return idx;
     }
     0
+}
+
+/// Owners (organizations or personal logins) that the user has hidden from
+/// the Pull Requests sidebar. Persisted in `ui_settings.json` under the
+/// `hidden_pr_orgs` key. Order is preserved as a `Vec` for deterministic
+/// JSON output but lookups treat it as a set.
+fn load_hidden_pr_orgs() -> HashSet<String> {
+    let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
+    if let Ok(src) = std::fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&src)
+        && let Some(arr) = val["hidden_pr_orgs"].as_array()
+    {
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+    }
+    HashSet::new()
 }
 
 fn load_idle_timeout_secs() -> u64 {
@@ -555,14 +576,34 @@ impl App {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("ui_settings.json");
         let name = &self.themes[self.theme_idx].name;
+        let mut hidden: Vec<&String> = self.hidden_pr_orgs.iter().collect();
+        hidden.sort();
         let json = serde_json::json!({
             "theme": name,
             "idle_timeout_secs": self.idle_timeout_secs,
+            "hidden_pr_orgs": hidden,
         });
         let _ = std::fs::write(
             &path,
             serde_json::to_string_pretty(&json).unwrap_or_default(),
         );
+    }
+
+    /// Hide a GitHub owner from the PR sidebar and persist the change. If the
+    /// hidden owner was the active view, switch back to the Inbox project so
+    /// the user isn't stranded on a now-invisible row.
+    pub fn hide_pr_org(&mut self, owner: String) {
+        if owner.is_empty() {
+            return;
+        }
+        let was_active = self.active_pr_org.as_deref() == Some(owner.as_str());
+        self.hidden_pr_orgs.insert(owner);
+        self.save_ui_settings();
+        if was_active {
+            self.active_pr_org = None;
+            // Drop focus to whichever project is currently selected.
+            self.active_pane = Pane::Projects;
+        }
     }
 
     pub fn new(client: TodoistClient, idle_forcer: bool, ephemeral: bool) -> Self {
@@ -636,6 +677,7 @@ impl App {
             github_prs_fetched_at: None,
             selected_pr: 0,
             gh_available: binary_available("gh"),
+            hidden_pr_orgs: load_hidden_pr_orgs(),
             jira_cards_view_active: false,
             jira_cards: Vec::new(),
             jira_cards_loading: false,
@@ -2222,12 +2264,17 @@ impl App {
     }
 
     /// Unique owners sorted alphabetically, with their open-PR counts. Empty
-    /// owners (malformed `repository.nameWithOwner`) are dropped.
+    /// owners (malformed `repository.nameWithOwner`) and any owners listed in
+    /// `hidden_pr_orgs` are dropped — those simply don't appear in the
+    /// sidebar.
     pub fn pr_owners_with_counts(&self) -> Vec<(String, usize)> {
         let mut counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for pr in &self.github_prs {
             if let Some((owner, _)) = pr.repo_full_name.split_once('/') {
+                if self.hidden_pr_orgs.contains(owner) {
+                    continue;
+                }
                 *counts.entry(owner.to_string()).or_insert(0) += 1;
             }
         }
@@ -3283,6 +3330,62 @@ mod tests {
         app.activate_upcoming_view();
         assert!(app.upcoming_view_active);
         assert!(!app.is_pr_view_active());
+    }
+
+    /// Hidden owners drop out of pr_owners_with_counts, so they no longer
+    /// appear as sidebar entries. The hidden set persists across save/load
+    /// (round-tripped via ui_settings.json), but here we just verify the
+    /// in-memory filter — the IO half is exercised by load_hidden_pr_orgs.
+    #[test]
+    fn hide_pr_org_removes_owner_from_sidebar() {
+        let mut app = test_app();
+        app.github_prs = vec![
+            PullRequest {
+                number: 1,
+                title: "a".into(),
+                url: String::new(),
+                repo_full_name: "appfolio/apm_bundle".into(),
+                author_login: "me".into(),
+                updated_at: String::new(),
+                is_draft: false,
+            },
+            PullRequest {
+                number: 2,
+                title: "c".into(),
+                url: String::new(),
+                repo_full_name: "cxrlos/ratatoist".into(),
+                author_login: "me".into(),
+                updated_at: String::new(),
+                is_draft: false,
+            },
+        ];
+
+        // Before hiding: both owners visible.
+        let before: Vec<_> = app
+            .pr_owners_with_counts()
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect();
+        assert_eq!(before, vec!["appfolio".to_string(), "cxrlos".to_string()]);
+
+        // Activate appfolio so we can verify the active view also resets on
+        // hide.
+        app.activate_github_prs_view("appfolio".to_string());
+        assert_eq!(app.active_pr_org.as_deref(), Some("appfolio"));
+
+        app.hide_pr_org("appfolio".to_string());
+
+        // appfolio is gone from the sidebar entries…
+        let after: Vec<_> = app
+            .pr_owners_with_counts()
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect();
+        assert_eq!(after, vec!["cxrlos".to_string()]);
+
+        // …and the active view was reset since its row vanished.
+        assert!(app.active_pr_org.is_none());
+        assert!(app.hidden_pr_orgs.contains("appfolio"));
     }
 
     /// Each GitHub owner in `github_prs` should yield exactly one sidebar

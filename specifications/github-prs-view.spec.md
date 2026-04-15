@@ -24,6 +24,7 @@ One virtual sidebar entry per GitHub owner (user or org) that has open pull requ
 
 - **`Enter`** — open the selected PR in the default browser via `gh pr view <url> --web`. No other interactions in v1.
 - **`r`** — re-run the gh fetch. Disabled while a fetch is already in progress.
+- **`h`** (with cursor on a PR org row in the sidebar) — hide that organization from the sidebar. Persisted in `ui_settings.json` under `hidden_pr_orgs`. **No unhide UI in v1** — to bring an org back, edit `~/Library/Application Support/ratatoist/ui_settings.json` and remove the entry from the `hidden_pr_orgs` array.
 - **`Esc`** — returns focus to the sidebar.
 
 ## Non-goals (v1)

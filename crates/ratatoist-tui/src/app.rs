@@ -1930,6 +1930,12 @@ impl App {
     }
 
     pub fn selected_project_name(&self) -> &str {
+        if self.today_view_active {
+            return "Today";
+        }
+        if self.upcoming_view_active {
+            return "Upcoming";
+        }
         self.projects
             .get(self.selected_project)
             .map(|p| p.name.as_str())

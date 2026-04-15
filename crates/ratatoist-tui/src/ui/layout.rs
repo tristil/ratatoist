@@ -150,7 +150,12 @@ fn render_tasks_block(frame: &mut Frame, app: &App, area: Rect, active: bool) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.dock_filter.is_some() {
+    if app.github_prs_view_active {
+        let [hint_area, prs_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+        render_prs_hint_row(frame, app, hint_area);
+        views::github_prs::render(frame, app, prs_area, active);
+    } else if app.dock_filter.is_some() {
         let [filter_area, banner_area, tasks_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
@@ -166,6 +171,27 @@ fn render_tasks_block(frame: &mut Frame, app: &App, area: Rect, active: bool) {
         render_filter_row(frame, app, filter_area);
         views::tasks::render(frame, app, tasks_area, active);
     }
+}
+
+fn render_prs_hint_row(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let fetched = app
+        .github_prs_fetched_at
+        .map(|at| at.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let loading = if app.github_prs_loading {
+        "  refreshing…"
+    } else {
+        ""
+    };
+    let line = Line::from(vec![
+        Span::styled("Enter ", theme.key_hint()),
+        Span::styled("open  ", theme.muted_text()),
+        Span::styled("r ", theme.key_hint()),
+        Span::styled("refresh  ", theme.muted_text()),
+        Span::styled(format!("· fetched {fetched}{loading}"), theme.muted_text()),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_filter_banner(frame: &mut Frame, app: &App, area: Rect) {

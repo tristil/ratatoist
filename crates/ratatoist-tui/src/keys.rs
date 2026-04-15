@@ -416,6 +416,16 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
             }
             KeyAction::Consumed
         }
+        KeyCode::Char('h')
+            if matches!(app.active_pane, Pane::Projects) && app.active_pr_org.is_some() =>
+        {
+            // Cursor is on a PR org row in the sidebar — hide that org.
+            // Persists to ui_settings.json so it stays hidden across restarts.
+            if let Some(owner) = app.active_pr_org.clone() {
+                app.hide_pr_org(owner);
+            }
+            KeyAction::Consumed
+        }
         KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => {
             match app.active_pane {
                 Pane::Tasks => app.active_pane = Pane::Projects,

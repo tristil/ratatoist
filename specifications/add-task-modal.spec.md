@@ -24,6 +24,11 @@ The modal that opens when the user presses `a` from the task list to create a ne
 - Priority is only included when greater than 1.
 - On server error the optimistic task is reverted.
 
+## Rendering
+
+- The modal renders over a dim overlay on the underlying UI.
+- The popup area is cleared before the block is drawn so no underlying text bleeds through the modal background — the surface is fully opaque.
+
 ## Out of Scope (v1)
 
 - Labels, description, section, or parent selection from the modal.

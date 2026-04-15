@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::Alignment;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
 use ratatoist_core::api::models::priority_label;
 
@@ -28,6 +28,10 @@ pub fn render(frame: &mut Frame, app: &App, form: &TaskForm) {
         .style(theme.base_bg());
 
     let inner = block.inner(popup);
+    // Clear the popup area so the dimmed underlying UI (and any leftover
+    // glyphs that Block only restyles, not overwrites) doesn't bleed through
+    // the modal's background.
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let mut lines = Vec::new();

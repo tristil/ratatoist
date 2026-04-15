@@ -2621,6 +2621,9 @@ async fn fetch_github_prs() -> Result<Vec<PullRequest>> {
             "@me",
             "--state",
             "open",
+            // Exclude PRs in archived repos — they can't be merged or closed,
+            // so they're permanent noise in this view.
+            "--archived=false",
             "--limit",
             "100",
             "--json",

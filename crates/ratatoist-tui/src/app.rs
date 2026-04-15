@@ -310,7 +310,9 @@ pub enum ProjectEntry {
     Separator,
     TodayView,
     UpcomingView,
-    GithubPrsView,
+    /// One entry per GitHub owner (user or org) that has at least one open PR.
+    /// The string is the owner login (`"cxrlos"`, `"appfolio"`, etc.).
+    GithubPrsView(String),
     JiraCardsView,
 }
 
@@ -319,7 +321,7 @@ pub enum ProjectNavItem {
     Project(usize),
     TodayView,
     UpcomingView,
-    GithubPrsView,
+    GithubPrsView(String),
     JiraCardsView,
 }
 
@@ -431,7 +433,10 @@ pub struct App {
     pub current_user_name: Option<String>,
     pub today_view_active: bool,
     pub upcoming_view_active: bool,
-    pub github_prs_view_active: bool,
+    /// Which GitHub owner's PRs are currently showing. `Some("cxrlos")` etc.
+    /// Replaces the older single-view bool; every entry in the sidebar binds
+    /// to one specific owner, and `None` means no PR view is focused.
+    pub active_pr_org: Option<String>,
     pub github_prs: Vec<PullRequest>,
     pub github_prs_loading: bool,
     pub github_prs_error: Option<String>,
@@ -624,7 +629,7 @@ impl App {
             current_user_name: None,
             today_view_active: false,
             upcoming_view_active: false,
-            github_prs_view_active: false,
+            active_pr_org: None,
             github_prs: Vec::new(),
             github_prs_loading: false,
             github_prs_error: None,
@@ -711,6 +716,13 @@ impl App {
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         info!("entering main loop");
 
+        // One-time fetch of open PRs at startup so the per-org sidebar
+        // entries can appear once the response lands. If gh isn't on PATH
+        // this is a no-op (the sidebar simply won't show any PR entries).
+        if self.gh_available && self.github_prs.is_empty() && self.github_prs_fetched_at.is_none() {
+            self.spawn_github_prs_fetch();
+        }
+
         while self.running {
             self.drain_bg_results();
 
@@ -740,7 +752,6 @@ impl App {
                     KeyAction::ProjectChanged => self.switch_to_project_tasks(),
                     KeyAction::TodayViewSelected => self.activate_today_view(),
                     KeyAction::UpcomingViewSelected => self.activate_upcoming_view(),
-                    KeyAction::GithubPrsViewSelected => self.activate_github_prs_view(),
                     KeyAction::RefreshGithubPrs => self.refresh_github_prs(),
                     KeyAction::OpenSelectedPrInBrowser => self.open_selected_pr_in_browser(),
                     KeyAction::JiraCardsViewSelected => self.activate_jira_cards_view(),
@@ -1311,7 +1322,7 @@ impl App {
     fn switch_to_project_tasks(&mut self) {
         self.today_view_active = false;
         self.upcoming_view_active = false;
-        self.github_prs_view_active = false;
+        self.active_pr_org = None;
         self.jira_cards_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
@@ -1321,7 +1332,7 @@ impl App {
         tracing::debug!("today view activated");
         self.today_view_active = true;
         self.upcoming_view_active = false;
-        self.github_prs_view_active = false;
+        self.active_pr_org = None;
         self.jira_cards_view_active = false;
         self.overdue_section_collapsed = false;
         self.selected_task = 0;
@@ -1350,27 +1361,28 @@ impl App {
         tracing::debug!("upcoming view activated");
         self.today_view_active = false;
         self.upcoming_view_active = true;
-        self.github_prs_view_active = false;
+        self.active_pr_org = None;
         self.jira_cards_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
     }
 
-    pub fn activate_github_prs_view(&mut self) {
-        tracing::debug!("github PRs view activated");
+    pub fn activate_github_prs_view(&mut self, owner: String) {
+        tracing::debug!(owner = %owner, "github PRs view activated");
         self.today_view_active = false;
         self.upcoming_view_active = false;
-        self.github_prs_view_active = true;
+        self.active_pr_org = Some(owner);
         self.jira_cards_view_active = false;
         self.selected_pr = 0;
-        self.spawn_github_prs_fetch();
+        // No fetch here — the initial fetch runs once on App::new().
+        // Manual refresh via the `r` key still works.
     }
 
     pub fn activate_jira_cards_view(&mut self) {
         tracing::debug!("jira cards view activated");
         self.today_view_active = false;
         self.upcoming_view_active = false;
-        self.github_prs_view_active = false;
+        self.active_pr_org = None;
         self.jira_cards_view_active = true;
         self.selected_jira_card = 0;
         self.spawn_jira_cards_fetch();
@@ -1411,7 +1423,8 @@ impl App {
     }
 
     pub fn open_selected_pr_in_browser(&mut self) {
-        let Some(pr) = self.github_prs.get(self.selected_pr) else {
+        let filtered = self.active_org_prs();
+        let Some(pr) = filtered.get(self.selected_pr) else {
             return;
         };
         let url = pr.url.clone();
@@ -1431,7 +1444,7 @@ impl App {
     }
 
     pub fn refresh_github_prs(&mut self) {
-        if self.github_prs_view_active {
+        if self.is_pr_view_active() {
             self.spawn_github_prs_fetch();
         }
     }
@@ -1964,8 +1977,14 @@ impl App {
                 if is_inbox {
                     entries.push(ProjectEntry::TodayView);
                     entries.push(ProjectEntry::UpcomingView);
+                    // One Pull Requests entry per GitHub owner that has open
+                    // PRs right now. We only emit entries for owners we've
+                    // seen data for, so before the startup fetch completes
+                    // (or if it fails), none appear.
                     if self.gh_available {
-                        entries.push(ProjectEntry::GithubPrsView);
+                        for (owner, _) in self.pr_owners_with_counts() {
+                            entries.push(ProjectEntry::GithubPrsView(owner));
+                        }
                     }
                     if self.acli_available {
                         entries.push(ProjectEntry::JiraCardsView);
@@ -2008,7 +2027,7 @@ impl App {
                 ProjectEntry::Project(i) => Some(ProjectNavItem::Project(i)),
                 ProjectEntry::TodayView => Some(ProjectNavItem::TodayView),
                 ProjectEntry::UpcomingView => Some(ProjectNavItem::UpcomingView),
-                ProjectEntry::GithubPrsView => Some(ProjectNavItem::GithubPrsView),
+                ProjectEntry::GithubPrsView(owner) => Some(ProjectNavItem::GithubPrsView(owner)),
                 ProjectEntry::JiraCardsView => Some(ProjectNavItem::JiraCardsView),
                 _ => None,
             })
@@ -2182,27 +2201,58 @@ impl App {
     pub fn on_virtual_view(&self) -> bool {
         self.today_view_active
             || self.upcoming_view_active
-            || self.github_prs_view_active
+            || self.active_pr_org.is_some()
             || self.jira_cards_view_active
     }
 
-    pub fn selected_project_name(&self) -> &str {
+    /// Any Pull Requests view (for some specific org) is currently active.
+    pub fn is_pr_view_active(&self) -> bool {
+        self.active_pr_org.is_some()
+    }
+
+    /// PRs filtered to the currently active org, in the order returned by gh.
+    pub fn active_org_prs(&self) -> Vec<&PullRequest> {
+        let Some(org) = &self.active_pr_org else {
+            return Vec::new();
+        };
+        self.github_prs
+            .iter()
+            .filter(|pr| pr.repo_full_name.starts_with(&format!("{org}/")))
+            .collect()
+    }
+
+    /// Unique owners sorted alphabetically, with their open-PR counts. Empty
+    /// owners (malformed `repository.nameWithOwner`) are dropped.
+    pub fn pr_owners_with_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for pr in &self.github_prs {
+            if let Some((owner, _)) = pr.repo_full_name.split_once('/') {
+                *counts.entry(owner.to_string()).or_insert(0) += 1;
+            }
+        }
+        let mut sorted: Vec<_> = counts.into_iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted
+    }
+
+    pub fn selected_project_name(&self) -> std::borrow::Cow<'_, str> {
         if self.today_view_active {
-            return "Today";
+            return "Today".into();
         }
         if self.upcoming_view_active {
-            return "Upcoming";
+            return "Upcoming".into();
         }
-        if self.github_prs_view_active {
-            return "Pull Requests";
+        if let Some(owner) = &self.active_pr_org {
+            return format!("Pull Requests · {owner}").into();
         }
         if self.jira_cards_view_active {
-            return "Jira Cards";
+            return "Jira Cards".into();
         }
         self.projects
             .get(self.selected_project)
-            .map(|p| p.name.as_str())
-            .unwrap_or("Tasks")
+            .map(|p| std::borrow::Cow::Borrowed(p.name.as_str()))
+            .unwrap_or(std::borrow::Cow::Borrowed("Tasks"))
     }
 
     pub fn selected_task(&self) -> Option<&Task> {
@@ -3171,7 +3221,7 @@ mod tests {
         let entries = app.project_list_entries();
         let has_prs = entries
             .iter()
-            .any(|e| matches!(e, ProjectEntry::GithubPrsView));
+            .any(|e| matches!(e, ProjectEntry::GithubPrsView(_)));
         let has_jira = entries
             .iter()
             .any(|e| matches!(e, ProjectEntry::JiraCardsView));
@@ -3179,11 +3229,30 @@ mod tests {
         assert!(!has_jira, "Jira hidden when acli missing");
 
         app.gh_available = true;
+        // Still no PR entry — gh is available but there are no PRs yet.
+        let entries = app.project_list_entries();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, ProjectEntry::GithubPrsView(_))),
+            "no PR entries until we have PR data"
+        );
+
+        app.github_prs.push(PullRequest {
+            number: 1,
+            title: "t".into(),
+            url: String::new(),
+            repo_full_name: "cxrlos/ratatoist".into(),
+            author_login: "me".into(),
+            updated_at: String::new(),
+            is_draft: false,
+        });
         let entries = app.project_list_entries();
         assert!(
             entries
                 .iter()
-                .any(|e| matches!(e, ProjectEntry::GithubPrsView))
+                .any(|e| matches!(e, ProjectEntry::GithubPrsView(_))),
+            "PR entry appears once we have data"
         );
         assert!(
             !entries
@@ -3201,22 +3270,96 @@ mod tests {
     }
 
     /// Switching among virtual views keeps them mutually exclusive.
-    #[tokio::test]
-    async fn github_prs_view_is_mutually_exclusive_with_today_and_upcoming() {
+    #[test]
+    fn github_prs_view_is_mutually_exclusive_with_today_and_upcoming() {
         let mut app = test_app();
         app.activate_today_view();
-        app.activate_github_prs_view();
-        assert!(app.github_prs_view_active);
+        app.activate_github_prs_view("cxrlos".to_string());
+        assert!(app.is_pr_view_active());
+        assert_eq!(app.active_pr_org.as_deref(), Some("cxrlos"));
         assert!(!app.today_view_active);
         assert!(!app.upcoming_view_active);
-        assert!(
-            app.github_prs_loading,
-            "activation should kick off a fetch"
-        );
 
         app.activate_upcoming_view();
         assert!(app.upcoming_view_active);
-        assert!(!app.github_prs_view_active);
+        assert!(!app.is_pr_view_active());
+    }
+
+    /// Each GitHub owner in `github_prs` should yield exactly one sidebar
+    /// entry, sorted alphabetically. Owners with zero PRs are dropped.
+    #[test]
+    fn pr_owners_with_counts_groups_by_owner() {
+        let mut app = test_app();
+        app.github_prs = vec![
+            PullRequest {
+                number: 1,
+                title: "a".into(),
+                url: String::new(),
+                repo_full_name: "appfolio/apm_bundle".into(),
+                author_login: "me".into(),
+                updated_at: String::new(),
+                is_draft: false,
+            },
+            PullRequest {
+                number: 2,
+                title: "b".into(),
+                url: String::new(),
+                repo_full_name: "appfolio/otto".into(),
+                author_login: "me".into(),
+                updated_at: String::new(),
+                is_draft: false,
+            },
+            PullRequest {
+                number: 3,
+                title: "c".into(),
+                url: String::new(),
+                repo_full_name: "cxrlos/ratatoist".into(),
+                author_login: "me".into(),
+                updated_at: String::new(),
+                is_draft: false,
+            },
+        ];
+
+        let owners = app.pr_owners_with_counts();
+        assert_eq!(
+            owners,
+            vec![
+                ("appfolio".to_string(), 2),
+                ("cxrlos".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_org_prs_filters_to_chosen_org() {
+        let mut app = test_app();
+        app.github_prs = vec![
+            PullRequest {
+                number: 1,
+                title: "apm".into(),
+                url: String::new(),
+                repo_full_name: "appfolio/apm_bundle".into(),
+                author_login: "me".into(),
+                updated_at: String::new(),
+                is_draft: false,
+            },
+            PullRequest {
+                number: 2,
+                title: "rata".into(),
+                url: String::new(),
+                repo_full_name: "cxrlos/ratatoist".into(),
+                author_login: "me".into(),
+                updated_at: String::new(),
+                is_draft: false,
+            },
+        ];
+        app.activate_github_prs_view("cxrlos".to_string());
+        let filtered: Vec<_> = app
+            .active_org_prs()
+            .iter()
+            .map(|p| p.repo_full_name.as_str())
+            .collect();
+        assert_eq!(filtered, vec!["cxrlos/ratatoist"]);
     }
 
     #[test]

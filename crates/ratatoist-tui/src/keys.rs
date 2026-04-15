@@ -40,7 +40,6 @@ pub enum KeyAction {
     CloseThemePicker,
     TodayViewSelected,
     UpcomingViewSelected,
-    GithubPrsViewSelected,
     RefreshGithubPrs,
     OpenSelectedPrInBrowser,
     JiraCardsViewSelected,
@@ -389,7 +388,7 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
         KeyCode::Char('f') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CycleFilter,
         KeyCode::Char('o') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CycleSort,
         KeyCode::Char('r')
-            if matches!(app.active_pane, Pane::Tasks) && app.github_prs_view_active =>
+            if matches!(app.active_pane, Pane::Tasks) && app.is_pr_view_active() =>
         {
             KeyAction::RefreshGithubPrs
         }
@@ -434,7 +433,7 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
                 app.active_pane = Pane::Tasks;
                 KeyAction::Consumed
             }
-            Pane::Tasks if app.github_prs_view_active => KeyAction::OpenSelectedPrInBrowser,
+            Pane::Tasks if app.is_pr_view_active() => KeyAction::OpenSelectedPrInBrowser,
             Pane::Tasks if app.jira_cards_view_active => KeyAction::OpenSelectedJiraCardInBrowser,
             Pane::Tasks => KeyAction::OpenDetail,
             _ => KeyAction::Consumed,
@@ -531,7 +530,7 @@ fn handle_standard(app: &mut App, key: KeyEvent) -> KeyAction {
                 app.active_pane = Pane::Tasks;
                 KeyAction::Consumed
             }
-            Pane::Tasks if app.github_prs_view_active => KeyAction::OpenSelectedPrInBrowser,
+            Pane::Tasks if app.is_pr_view_active() => KeyAction::OpenSelectedPrInBrowser,
             Pane::Tasks if app.jira_cards_view_active => KeyAction::OpenSelectedJiraCardInBrowser,
             Pane::Tasks => KeyAction::OpenDetail,
             _ => KeyAction::Consumed,
@@ -578,8 +577,9 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                     ProjectNavItem::UpcomingView => {
                         app.upcoming_view_active && app.folder_cursor.is_none()
                     }
-                    ProjectNavItem::GithubPrsView => {
-                        app.github_prs_view_active && app.folder_cursor.is_none()
+                    ProjectNavItem::GithubPrsView(owner) => {
+                        app.active_pr_org.as_deref() == Some(owner.as_str())
+                            && app.folder_cursor.is_none()
                     }
                     ProjectNavItem::JiraCardsView => {
                         app.jira_cards_view_active && app.folder_cursor.is_none()
@@ -595,14 +595,15 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
             if next_pos < 0 {
                 return KeyAction::Consumed;
             }
-            match nav[next_pos as usize] {
+            match &nav[next_pos as usize] {
                 ProjectNavItem::Project(i) => {
+                    let i = *i;
                     app.folder_cursor = None;
                     app.selected_project = i;
                     KeyAction::ProjectChanged
                 }
                 ProjectNavItem::Folder(fi) => {
-                    app.folder_cursor = Some(fi);
+                    app.folder_cursor = Some(*fi);
                     KeyAction::Consumed
                 }
                 ProjectNavItem::TodayView => {
@@ -613,9 +614,11 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                     app.folder_cursor = None;
                     KeyAction::UpcomingViewSelected
                 }
-                ProjectNavItem::GithubPrsView => {
+                ProjectNavItem::GithubPrsView(owner) => {
+                    let owner = owner.clone();
                     app.folder_cursor = None;
-                    KeyAction::GithubPrsViewSelected
+                    app.activate_github_prs_view(owner);
+                    KeyAction::Consumed
                 }
                 ProjectNavItem::JiraCardsView => {
                     app.folder_cursor = None;
@@ -633,8 +636,8 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                 app.selected_jira_card = (current + delta).rem_euclid(len as i32) as usize;
                 return KeyAction::Consumed;
             }
-            if app.github_prs_view_active {
-                let len = app.github_prs.len();
+            if app.is_pr_view_active() {
+                let len = app.active_org_prs().len();
                 if len == 0 {
                     return KeyAction::Consumed;
                 }
@@ -688,9 +691,11 @@ fn jump_to_edge(app: &mut App, top: bool) -> KeyAction {
                     app.folder_cursor = None;
                     return KeyAction::UpcomingViewSelected;
                 }
-                Some(ProjectNavItem::GithubPrsView) => {
+                Some(ProjectNavItem::GithubPrsView(owner)) => {
+                    let owner = owner.clone();
                     app.folder_cursor = None;
-                    return KeyAction::GithubPrsViewSelected;
+                    app.activate_github_prs_view(owner);
+                    return KeyAction::Consumed;
                 }
                 Some(ProjectNavItem::JiraCardsView) => {
                     app.folder_cursor = None;

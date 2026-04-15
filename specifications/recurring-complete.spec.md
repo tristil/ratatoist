@@ -4,8 +4,8 @@ Pressing `x` on a recurring task advances the series to its next occurrence; the
 
 ## Behavior
 
-- Sync command sent: `item_complete` (not `item_close` — that would end the series).
-- Optimistic UI does **not** flip `checked` on the task. The task stays visible and unchecked until the server's response updates its due date.
+- Sync command sent: `item_close`. This mirrors what the official Todoist clients do — for recurring tasks it advances to the next occurrence, for non-recurring tasks it closes normally. `item_complete` is *not* used because it marks the entire series as done.
+- Optimistic UI does **not** flip `checked` on recurring tasks. The task stays visible and unchecked until the server's response updates its due date.
 - Undoing (pressing `x` on a task that is already checked) always sends `item_reopen` regardless of recurrence and flips `checked` optimistically.
 - Non-recurring tasks retain the old behavior: `checked` flips immediately for instant feedback and the command is `item_close`.
 

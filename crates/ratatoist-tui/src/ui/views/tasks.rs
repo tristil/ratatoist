@@ -40,7 +40,23 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         return;
     }
 
-    if visible.is_empty() && !app.today_view_active && app.dock_filter.is_none() {
+    if app.upcoming_view_active && visible.is_empty() {
+        let lines = vec![
+            ListItem::new(Line::default()),
+            ListItem::new(Line::from(Span::styled(
+                "No scheduled tasks",
+                theme.muted_text(),
+            ))),
+        ];
+        frame.render_widget(List::new(lines), area);
+        return;
+    }
+
+    if visible.is_empty()
+        && !app.today_view_active
+        && !app.upcoming_view_active
+        && app.dock_filter.is_none()
+    {
         let hint = match app.input_mode {
             InputMode::Vim(_) => "press a to add a task",
             InputMode::Standard => "press Ctrl-a to add a task",
@@ -69,12 +85,14 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         return;
     }
 
-    let cross_project = app.today_view_active || app.dock_filter.is_some();
+    let cross_project =
+        app.today_view_active || app.upcoming_view_active || app.dock_filter.is_some();
 
     let mut items: Vec<ListItem> = Vec::new();
     let mut visual_selected: Option<usize> = None;
     let mut current_project_id: Option<String> = None;
     let mut last_section_id: Option<String> = None;
+    let mut last_upcoming_date: Option<String> = None;
 
     let today = dates::today_str();
     let stats = if app.today_view_active {
@@ -104,6 +122,28 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
                 theme.due_overdue().add_modifier(Modifier::BOLD),
             )])));
             overdue_header_shown = true;
+        }
+
+        // Upcoming view: insert a day header each time the date changes.
+        if app.upcoming_view_active
+            && let Some(due) = &task.due
+        {
+            let date = &due.date;
+            if last_upcoming_date.as_deref() != Some(date.as_str()) {
+                if !items.is_empty() {
+                    items.push(ListItem::new(Line::default()));
+                }
+                let header = dates::format_upcoming_header(date);
+                let style = if date.as_str() < today.as_str() {
+                    theme.due_overdue().add_modifier(Modifier::BOLD)
+                } else if date.as_str() == today.as_str() {
+                    theme.due_today().add_modifier(Modifier::BOLD)
+                } else {
+                    theme.due_upcoming().add_modifier(Modifier::BOLD)
+                };
+                items.push(ListItem::new(Line::from(Span::styled(header, style))));
+                last_upcoming_date = Some(date.clone());
+            }
         }
 
         // Cross-project: show project name header when project changes (dock filter or today view).

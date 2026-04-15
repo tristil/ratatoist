@@ -12,10 +12,14 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
 
     let selected_visual = entries.iter().position(|e| match e {
         ProjectEntry::Project(i) => {
-            !app.today_view_active && app.folder_cursor.is_none() && *i == app.selected_project
+            !app.today_view_active
+                && !app.upcoming_view_active
+                && app.folder_cursor.is_none()
+                && *i == app.selected_project
         }
         ProjectEntry::FolderHeader(fi) => app.folder_cursor == Some(*fi),
         ProjectEntry::TodayView => app.today_view_active && app.folder_cursor.is_none(),
+        ProjectEntry::UpcomingView => app.upcoming_view_active && app.folder_cursor.is_none(),
         _ => false,
     });
 
@@ -64,6 +68,19 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
                     Span::raw("  "),
                     Span::styled("⊙ ", Style::default().fg(Color::Yellow)),
                     Span::styled("Today", theme.normal_text()),
+                ];
+                if count > 0 {
+                    spans.push(Span::styled(format!("  {count}"), theme.muted_text()));
+                }
+                ListItem::new(Line::from(spans))
+            }
+
+            ProjectEntry::UpcomingView => {
+                let count = app.upcoming_task_count();
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled("▦ ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Upcoming", theme.normal_text()),
                 ];
                 if count > 0 {
                     spans.push(Span::styled(format!("  {count}"), theme.muted_text()));

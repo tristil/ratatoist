@@ -309,13 +309,16 @@ pub enum ProjectEntry {
     Project(usize),
     Separator,
     TodayView,
+    UpcomingView,
 }
 
 pub enum ProjectNavItem {
     Folder(usize),
     Project(usize),
     TodayView,
+    UpcomingView,
 }
+
 
 enum BgResult {
     SyncDelta(Box<SyncResponse>),
@@ -383,6 +386,7 @@ pub struct App {
     pub folder_cursor: Option<usize>,
     pub current_user_name: Option<String>,
     pub today_view_active: bool,
+    pub upcoming_view_active: bool,
     pub overdue_section_collapsed: bool,
     last_activity: Instant,
     pending_ws_sync: bool,
@@ -555,6 +559,7 @@ impl App {
             folder_cursor: None,
             current_user_name: None,
             today_view_active: false,
+            upcoming_view_active: false,
             overdue_section_collapsed: false,
             last_activity: Instant::now(),
             pending_ws_sync: false,
@@ -655,6 +660,7 @@ impl App {
                     }
                     KeyAction::ProjectChanged => self.switch_to_project_tasks(),
                     KeyAction::TodayViewSelected => self.activate_today_view(),
+                    KeyAction::UpcomingViewSelected => self.activate_upcoming_view(),
                     KeyAction::ToggleOverdueSection => self.toggle_overdue_section(),
                     KeyAction::OpenDetail => self.open_detail(),
                     KeyAction::CloseDetail => {
@@ -1167,6 +1173,7 @@ impl App {
 
     fn switch_to_project_tasks(&mut self) {
         self.today_view_active = false;
+        self.upcoming_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
     }
@@ -1174,7 +1181,34 @@ impl App {
     pub fn activate_today_view(&mut self) {
         tracing::debug!("today view activated");
         self.today_view_active = true;
+        self.upcoming_view_active = false;
         self.overdue_section_collapsed = false;
+        self.selected_task = 0;
+        self.detail_scroll = 0;
+    }
+
+    /// Number of tasks that would appear in the Upcoming view (all scheduled
+    /// active parent tasks assigned to me or unassigned). Used for the
+    /// sidebar badge.
+    pub fn upcoming_task_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|t| {
+                if t.is_deleted || t.checked || t.parent_id.is_some() || t.due.is_none() {
+                    return false;
+                }
+                match &t.responsible_uid {
+                    None => true,
+                    Some(uid) => self.current_user_id.as_deref() == Some(uid.as_str()),
+                }
+            })
+            .count()
+    }
+
+    pub fn activate_upcoming_view(&mut self) {
+        tracing::debug!("upcoming view activated");
+        self.today_view_active = false;
+        self.upcoming_view_active = true;
         self.selected_task = 0;
         self.detail_scroll = 0;
     }
@@ -1259,17 +1293,22 @@ impl App {
     }
 
     fn start_input(&mut self) {
-        // From Today view the task has no "current project" — fall back to the
-        // user's Inbox and pre-fill the due date so submitting without
-        // touching it produces a task that shows up on Today.
-        let (project_id, default_due) = if self.today_view_active {
-            let inbox_id = self
-                .projects
+        // Virtual views (Today, Upcoming) have no "current project" — fall
+        // back to the user's Inbox. Today also pre-fills the due date so the
+        // task shows up on Today without extra keystrokes; Upcoming leaves
+        // the due date blank since the user hasn't committed to a specific
+        // day just by being in the view.
+        let inbox_id = || {
+            self.projects
                 .iter()
                 .find(|p| p.is_inbox())
                 .map(|p| p.id.clone())
-                .unwrap_or_default();
-            (inbox_id, "today")
+                .unwrap_or_default()
+        };
+        let (project_id, default_due) = if self.today_view_active {
+            (inbox_id(), "today")
+        } else if self.upcoming_view_active {
+            (inbox_id(), "")
         } else {
             let pid = self
                 .projects
@@ -1685,6 +1724,7 @@ impl App {
                 entries.push(ProjectEntry::Project(i));
                 if is_inbox {
                     entries.push(ProjectEntry::TodayView);
+                    entries.push(ProjectEntry::UpcomingView);
                 }
             }
         }
@@ -1722,6 +1762,7 @@ impl App {
                 ProjectEntry::FolderHeader(fi) => Some(ProjectNavItem::Folder(fi)),
                 ProjectEntry::Project(i) => Some(ProjectNavItem::Project(i)),
                 ProjectEntry::TodayView => Some(ProjectNavItem::TodayView),
+                ProjectEntry::UpcomingView => Some(ProjectNavItem::UpcomingView),
                 _ => None,
             })
             .collect()
@@ -1986,6 +2027,38 @@ impl App {
                         .is_some_and(|d| d.date.as_str() == today.as_str())
                 });
             }
+            return tasks;
+        }
+
+        if self.upcoming_view_active {
+            // Upcoming is unbounded forward: every active parent task that
+            // has any due date (overdue, today, or future). Tasks without a
+            // due date are excluded — Upcoming is specifically the scheduled
+            // view.
+            let mut tasks: Vec<&Task> = self
+                .tasks
+                .iter()
+                .filter(|t| {
+                    if t.is_deleted || t.checked || t.parent_id.is_some() {
+                        return false;
+                    }
+                    if t.due.is_none() {
+                        return false;
+                    }
+                    match &t.responsible_uid {
+                        None => true,
+                        Some(uid) => self.current_user_id.as_deref() == Some(uid.as_str()),
+                    }
+                })
+                .collect();
+            tasks.sort_by(|a, b| {
+                let a_date = a.due.as_ref().map(|d| d.date.as_str()).unwrap_or("");
+                let b_date = b.due.as_ref().map(|d| d.date.as_str()).unwrap_or("");
+                a_date
+                    .cmp(b_date)
+                    .then(a.project_id.cmp(&b.project_id))
+                    .then(a.child_order.cmp(&b.child_order))
+            });
             return tasks;
         }
 
@@ -2502,6 +2575,113 @@ mod tests {
 
     /// Completing a non-recurring task flips to checked immediately for
     /// instant UI feedback, and sends item_close.
+    /// Upcoming shows every active parent task with a due date — overdue,
+    /// today, and future — assigned to the current user or unassigned,
+    /// sorted by date.
+    #[test]
+    fn upcoming_view_lists_all_scheduled_tasks_sorted_by_date() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+
+        // Overdue
+        app.tasks.push(Task {
+            id: "past".to_string(),
+            content: "Old".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: "2026-04-10".to_string(),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        // Today
+        app.tasks.push(Task {
+            id: "today".to_string(),
+            content: "Now".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        // Future
+        app.tasks.push(Task {
+            id: "future".to_string(),
+            content: "Later".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: crate::ui::dates::offset_days_str(30),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        // No due date — excluded
+        app.tasks.push(Task {
+            id: "undated".to_string(),
+            content: "Someday".to_string(),
+            project_id: "p1".to_string(),
+            due: None,
+            ..Task::default()
+        });
+        // Completed — excluded
+        app.tasks.push(Task {
+            id: "done".to_string(),
+            content: "Shipped".to_string(),
+            project_id: "p1".to_string(),
+            checked: true,
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+
+        app.activate_upcoming_view();
+        let ids: Vec<&str> = app.visible_tasks().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["past", "today", "future"]);
+    }
+
+    /// Adding from Upcoming targets Inbox and leaves the due date blank —
+    /// the user picks the day, unlike Today which defaults to "today".
+    #[test]
+    fn add_from_upcoming_view_targets_inbox_no_default_due() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "inbox_1".to_string(),
+            name: "Inbox".to_string(),
+            inbox_project: Some(true),
+            ..Project::default()
+        });
+        app.projects.push(Project {
+            id: "p2".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.selected_project = 1;
+        app.activate_upcoming_view();
+
+        app.start_input();
+
+        let form = app.task_form.as_ref().expect("form opens");
+        assert_eq!(form.project_id, "inbox_1");
+        assert_eq!(form.due_string, "");
+    }
+
+    #[test]
+    fn activating_upcoming_deactivates_today() {
+        let mut app = test_app();
+        app.activate_today_view();
+        assert!(app.today_view_active);
+        app.activate_upcoming_view();
+        assert!(app.upcoming_view_active);
+        assert!(!app.today_view_active);
+    }
+
     #[test]
     fn complete_nonrecurring_flips_checked_and_sends_item_close() {
         let mut app = test_app();

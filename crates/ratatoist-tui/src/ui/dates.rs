@@ -63,6 +63,53 @@ pub fn today_str() -> String {
         .to_string()
 }
 
+/// Format a `YYYY-MM-DD` date as a section header for the Upcoming view,
+/// matching Todoist's style: `"15 Apr · Today · Wednesday"`,
+/// `"16 Apr · Tomorrow · Thursday"`, or `"17 Apr · Friday"` for dates farther
+/// out. Dates in the past render as `"1 Apr · Overdue · Tuesday"`.
+pub fn format_upcoming_header(date_str: &str) -> String {
+    let today = today_str();
+    let days_away = days_between(&today, date_str);
+    let (_, m, d) = parse_date(date_str).unwrap_or((0, 0, 0));
+    let months = [
+        "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = months.get(m as usize).unwrap_or(&"???");
+    let weekday = weekday_name(date_str);
+
+    let relative = match days_away {
+        0 => Some("Today"),
+        1 => Some("Tomorrow"),
+        n if n < 0 => Some("Overdue"),
+        _ => None,
+    };
+
+    match relative {
+        Some(label) => format!("{d} {month} · {label} · {weekday}"),
+        None => format!("{d} {month} · {weekday}"),
+    }
+}
+
+fn weekday_name(date_str: &str) -> &'static str {
+    let Some((y, m, d)) = parse_date(date_str) else {
+        return "";
+    };
+    // Zeller-style weekday from civil days; Sunday = 0..Saturday = 6 in the
+    // days_from_civil epoch (1970-01-01 is Thursday, days = 0).
+    let days = days_from_civil(y, m, d);
+    let wd = ((days % 7) + 7 + 4) % 7; // shift so Sunday = 0
+    match wd {
+        0 => "Sunday",
+        1 => "Monday",
+        2 => "Tuesday",
+        3 => "Wednesday",
+        4 => "Thursday",
+        5 => "Friday",
+        6 => "Saturday",
+        _ => "",
+    }
+}
+
 pub fn offset_days_str(days: i64) -> String {
     let today = chrono::Local::now().date_naive();
     (today + chrono::Duration::days(days))

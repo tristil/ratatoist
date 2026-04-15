@@ -311,6 +311,7 @@ pub enum ProjectEntry {
     TodayView,
     UpcomingView,
     GithubPrsView,
+    JiraCardsView,
 }
 
 pub enum ProjectNavItem {
@@ -319,6 +320,19 @@ pub enum ProjectNavItem {
     TodayView,
     UpcomingView,
     GithubPrsView,
+    JiraCardsView,
+}
+
+/// Check whether a CLI tool is on PATH and responds to `--version`. Runs once
+/// at startup; cheap and synchronous.
+fn binary_available(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// A pull request row as returned by `gh search prs --json ...`. Subset of the
@@ -334,6 +348,19 @@ pub struct PullRequest {
     pub is_draft: bool,
 }
 
+/// A Jira work item as returned by `acli jira workitem search --json`.
+#[derive(Debug, Clone, Default)]
+pub struct JiraCard {
+    pub key: String,
+    pub summary: String,
+    pub status: String,
+    pub priority: String,
+    pub issue_type: String,
+    /// Project key parsed from the issue key ("PROJ-123" → "PROJ"). Used for
+    /// grouping in the view.
+    pub project_key: String,
+}
+
 
 enum BgResult {
     SyncDelta(Box<SyncResponse>),
@@ -346,6 +373,7 @@ enum BgResult {
     WebSocketEvent,
     WebSocketDisconnected,
     GithubPrsFetched(Result<Vec<PullRequest>>),
+    JiraCardsFetched(Result<Vec<JiraCard>>),
     Comments {
         task_id: String,
         comments: Result<Vec<Comment>>,
@@ -409,6 +437,14 @@ pub struct App {
     pub github_prs_error: Option<String>,
     pub github_prs_fetched_at: Option<chrono::DateTime<Local>>,
     pub selected_pr: usize,
+    pub gh_available: bool,
+    pub jira_cards_view_active: bool,
+    pub jira_cards: Vec<JiraCard>,
+    pub jira_cards_loading: bool,
+    pub jira_cards_error: Option<String>,
+    pub jira_cards_fetched_at: Option<chrono::DateTime<Local>>,
+    pub selected_jira_card: usize,
+    pub acli_available: bool,
     pub overdue_section_collapsed: bool,
     last_activity: Instant,
     pending_ws_sync: bool,
@@ -594,6 +630,14 @@ impl App {
             github_prs_error: None,
             github_prs_fetched_at: None,
             selected_pr: 0,
+            gh_available: binary_available("gh"),
+            jira_cards_view_active: false,
+            jira_cards: Vec::new(),
+            jira_cards_loading: false,
+            jira_cards_error: None,
+            jira_cards_fetched_at: None,
+            selected_jira_card: 0,
+            acli_available: binary_available("acli"),
             overdue_section_collapsed: false,
             last_activity: Instant::now(),
             pending_ws_sync: false,
@@ -699,6 +743,11 @@ impl App {
                     KeyAction::GithubPrsViewSelected => self.activate_github_prs_view(),
                     KeyAction::RefreshGithubPrs => self.refresh_github_prs(),
                     KeyAction::OpenSelectedPrInBrowser => self.open_selected_pr_in_browser(),
+                    KeyAction::JiraCardsViewSelected => self.activate_jira_cards_view(),
+                    KeyAction::RefreshJiraCards => self.refresh_jira_cards(),
+                    KeyAction::OpenSelectedJiraCardInBrowser => {
+                        self.open_selected_jira_card_in_browser()
+                    }
                     KeyAction::ToggleOverdueSection => self.toggle_overdue_section(),
                     KeyAction::OpenDetail => self.open_detail(),
                     KeyAction::CloseDetail => {
@@ -1156,6 +1205,24 @@ impl App {
                     }
                 }
 
+                BgResult::JiraCardsFetched(result) => {
+                    self.jira_cards_loading = false;
+                    self.jira_cards_fetched_at = Some(Local::now());
+                    match result {
+                        Ok(cards) => {
+                            self.jira_cards = cards;
+                            self.selected_jira_card = self
+                                .selected_jira_card
+                                .min(self.jira_cards.len().saturating_sub(1));
+                            self.jira_cards_error = None;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "jira cards fetch failed");
+                            self.jira_cards_error = Some(e.to_string());
+                        }
+                    }
+                }
+
                 BgResult::Comments {
                     task_id,
                     comments,
@@ -1245,6 +1312,7 @@ impl App {
         self.today_view_active = false;
         self.upcoming_view_active = false;
         self.github_prs_view_active = false;
+        self.jira_cards_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
     }
@@ -1254,6 +1322,7 @@ impl App {
         self.today_view_active = true;
         self.upcoming_view_active = false;
         self.github_prs_view_active = false;
+        self.jira_cards_view_active = false;
         self.overdue_section_collapsed = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
@@ -1282,6 +1351,7 @@ impl App {
         self.today_view_active = false;
         self.upcoming_view_active = true;
         self.github_prs_view_active = false;
+        self.jira_cards_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
     }
@@ -1291,8 +1361,53 @@ impl App {
         self.today_view_active = false;
         self.upcoming_view_active = false;
         self.github_prs_view_active = true;
+        self.jira_cards_view_active = false;
         self.selected_pr = 0;
         self.spawn_github_prs_fetch();
+    }
+
+    pub fn activate_jira_cards_view(&mut self) {
+        tracing::debug!("jira cards view activated");
+        self.today_view_active = false;
+        self.upcoming_view_active = false;
+        self.github_prs_view_active = false;
+        self.jira_cards_view_active = true;
+        self.selected_jira_card = 0;
+        self.spawn_jira_cards_fetch();
+    }
+
+    pub fn refresh_jira_cards(&mut self) {
+        if self.jira_cards_view_active {
+            self.spawn_jira_cards_fetch();
+        }
+    }
+
+    pub fn open_selected_jira_card_in_browser(&mut self) {
+        let Some(card) = self.jira_cards.get(self.selected_jira_card) else {
+            return;
+        };
+        let key = card.key.clone();
+        tokio::spawn(async move {
+            let _ = tokio::process::Command::new("acli")
+                .args(["jira", "workitem", "view", &key, "--web"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        });
+    }
+
+    fn spawn_jira_cards_fetch(&mut self) {
+        if self.jira_cards_loading {
+            return;
+        }
+        self.jira_cards_loading = true;
+        self.jira_cards_error = None;
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = fetch_jira_cards().await;
+            let _ = tx.send(BgResult::JiraCardsFetched(result)).await;
+        });
     }
 
     pub fn open_selected_pr_in_browser(&mut self) {
@@ -1849,7 +1964,12 @@ impl App {
                 if is_inbox {
                     entries.push(ProjectEntry::TodayView);
                     entries.push(ProjectEntry::UpcomingView);
-                    entries.push(ProjectEntry::GithubPrsView);
+                    if self.gh_available {
+                        entries.push(ProjectEntry::GithubPrsView);
+                    }
+                    if self.acli_available {
+                        entries.push(ProjectEntry::JiraCardsView);
+                    }
                 }
             }
         }
@@ -1889,6 +2009,7 @@ impl App {
                 ProjectEntry::TodayView => Some(ProjectNavItem::TodayView),
                 ProjectEntry::UpcomingView => Some(ProjectNavItem::UpcomingView),
                 ProjectEntry::GithubPrsView => Some(ProjectNavItem::GithubPrsView),
+                ProjectEntry::JiraCardsView => Some(ProjectNavItem::JiraCardsView),
                 _ => None,
             })
             .collect()
@@ -2059,7 +2180,10 @@ impl App {
     /// currently active and the underlying `selected_project` should be
     /// ignored for display, navigation, or add-task defaults.
     pub fn on_virtual_view(&self) -> bool {
-        self.today_view_active || self.upcoming_view_active || self.github_prs_view_active
+        self.today_view_active
+            || self.upcoming_view_active
+            || self.github_prs_view_active
+            || self.jira_cards_view_active
     }
 
     pub fn selected_project_name(&self) -> &str {
@@ -2071,6 +2195,9 @@ impl App {
         }
         if self.github_prs_view_active {
             return "Pull Requests";
+        }
+        if self.jira_cards_view_active {
+            return "Jira Cards";
         }
         self.projects
             .get(self.selected_project)
@@ -2539,6 +2666,88 @@ async fn fetch_github_prs() -> Result<Vec<PullRequest>> {
     Ok(prs)
 }
 
+/// Shell out to `acli jira workitem search` and parse the JSON output into
+/// `JiraCard` records. Errors (unauthenticated, missing acli, network) surface
+/// as the error message.
+async fn fetch_jira_cards() -> Result<Vec<JiraCard>> {
+    use tokio::process::Command;
+
+    let output = Command::new("acli")
+        .args([
+            "jira",
+            "workitem",
+            "search",
+            "--jql",
+            "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
+            "--fields",
+            "key,summary,status,priority,issuetype",
+            "--limit",
+            "100",
+            "--json",
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to invoke acli: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if stderr.is_empty() {
+            format!("acli exited with status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(anyhow::anyhow!("{msg}"));
+    }
+
+    // The JSON shape is an array of objects with the fields we requested.
+    // Nested fields (status.name, priority.name, issuetype.name, assignee) are
+    // objects; we extract the name strings.
+    let raw: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("acli JSON parse error: {e}"))?;
+
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("expected JSON array from acli"))?;
+
+    let pick_name = |v: &serde_json::Value| -> String {
+        // Fields come back as either `"In Progress"` (string) or
+        // `{ "name": "In Progress", ... }` depending on acli version; handle
+        // both.
+        if let Some(s) = v.as_str() {
+            return s.to_string();
+        }
+        v.get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let mut cards = Vec::with_capacity(arr.len());
+    for item in arr {
+        // Keys may live at the top level or under `fields`.
+        let fields = item.get("fields").unwrap_or(item);
+        let key = item
+            .get("key")
+            .and_then(|k| k.as_str())
+            .unwrap_or("")
+            .to_string();
+        let project_key = key.split_once('-').map(|(p, _)| p.to_string()).unwrap_or_default();
+        cards.push(JiraCard {
+            key,
+            project_key,
+            summary: fields
+                .get("summary")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            status: pick_name(fields.get("status").unwrap_or(&serde_json::Value::Null)),
+            priority: pick_name(fields.get("priority").unwrap_or(&serde_json::Value::Null)),
+            issue_type: pick_name(fields.get("issuetype").unwrap_or(&serde_json::Value::Null)),
+        });
+    }
+    Ok(cards)
+}
+
 async fn run_websocket(url: String, tx: mpsc::Sender<BgResult>) {
     use futures_util::StreamExt;
     use tokio_tungstenite::connect_async_tls_with_config;
@@ -2940,6 +3149,52 @@ mod tests {
         app.activate_upcoming_view();
         assert!(app.upcoming_view_active);
         assert!(!app.today_view_active);
+    }
+
+    /// Sidebar hides the Pull Requests entry when `gh` isn't on PATH and the
+    /// Jira Cards entry when `acli` isn't on PATH.
+    #[test]
+    fn sidebar_hides_external_entries_when_cli_missing() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "inbox".to_string(),
+            name: "Inbox".to_string(),
+            inbox_project: Some(true),
+            ..Project::default()
+        });
+        app.gh_available = false;
+        app.acli_available = false;
+
+        let entries = app.project_list_entries();
+        let has_prs = entries
+            .iter()
+            .any(|e| matches!(e, ProjectEntry::GithubPrsView));
+        let has_jira = entries
+            .iter()
+            .any(|e| matches!(e, ProjectEntry::JiraCardsView));
+        assert!(!has_prs, "PRs hidden when gh missing");
+        assert!(!has_jira, "Jira hidden when acli missing");
+
+        app.gh_available = true;
+        let entries = app.project_list_entries();
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, ProjectEntry::GithubPrsView))
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, ProjectEntry::JiraCardsView))
+        );
+
+        app.acli_available = true;
+        let entries = app.project_list_entries();
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, ProjectEntry::JiraCardsView))
+        );
     }
 
     /// Switching among virtual views keeps them mutually exclusive.

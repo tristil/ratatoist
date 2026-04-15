@@ -43,6 +43,9 @@ pub enum KeyAction {
     GithubPrsViewSelected,
     RefreshGithubPrs,
     OpenSelectedPrInBrowser,
+    JiraCardsViewSelected,
+    RefreshJiraCards,
+    OpenSelectedJiraCardInBrowser,
     ToggleOverdueSection,
     Consumed,
     None,
@@ -390,6 +393,11 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
         {
             KeyAction::RefreshGithubPrs
         }
+        KeyCode::Char('r')
+            if matches!(app.active_pane, Pane::Tasks) && app.jira_cards_view_active =>
+        {
+            KeyAction::RefreshJiraCards
+        }
         KeyCode::Char('s') if matches!(app.active_pane, Pane::Projects) => KeyAction::StarProject,
 
         KeyCode::Char('j') | KeyCode::Down => move_in_pane(app, 1),
@@ -427,6 +435,7 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
                 KeyAction::Consumed
             }
             Pane::Tasks if app.github_prs_view_active => KeyAction::OpenSelectedPrInBrowser,
+            Pane::Tasks if app.jira_cards_view_active => KeyAction::OpenSelectedJiraCardInBrowser,
             Pane::Tasks => KeyAction::OpenDetail,
             _ => KeyAction::Consumed,
         },
@@ -523,6 +532,7 @@ fn handle_standard(app: &mut App, key: KeyEvent) -> KeyAction {
                 KeyAction::Consumed
             }
             Pane::Tasks if app.github_prs_view_active => KeyAction::OpenSelectedPrInBrowser,
+            Pane::Tasks if app.jira_cards_view_active => KeyAction::OpenSelectedJiraCardInBrowser,
             Pane::Tasks => KeyAction::OpenDetail,
             _ => KeyAction::Consumed,
         },
@@ -571,6 +581,9 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                     ProjectNavItem::GithubPrsView => {
                         app.github_prs_view_active && app.folder_cursor.is_none()
                     }
+                    ProjectNavItem::JiraCardsView => {
+                        app.jira_cards_view_active && app.folder_cursor.is_none()
+                    }
                 })
                 .unwrap_or(0) as i32;
             let next_pos = pos + delta;
@@ -604,9 +617,22 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                     app.folder_cursor = None;
                     KeyAction::GithubPrsViewSelected
                 }
+                ProjectNavItem::JiraCardsView => {
+                    app.folder_cursor = None;
+                    KeyAction::JiraCardsViewSelected
+                }
             }
         }
         Pane::Tasks => {
+            if app.jira_cards_view_active {
+                let len = app.jira_cards.len();
+                if len == 0 {
+                    return KeyAction::Consumed;
+                }
+                let current = app.selected_jira_card as i32;
+                app.selected_jira_card = (current + delta).rem_euclid(len as i32) as usize;
+                return KeyAction::Consumed;
+            }
             if app.github_prs_view_active {
                 let len = app.github_prs.len();
                 if len == 0 {
@@ -665,6 +691,10 @@ fn jump_to_edge(app: &mut App, top: bool) -> KeyAction {
                 Some(ProjectNavItem::GithubPrsView) => {
                     app.folder_cursor = None;
                     return KeyAction::GithubPrsViewSelected;
+                }
+                Some(ProjectNavItem::JiraCardsView) => {
+                    app.folder_cursor = None;
+                    return KeyAction::JiraCardsViewSelected;
                 }
                 None => {}
             }

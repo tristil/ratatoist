@@ -4,6 +4,7 @@ A virtual sidebar entry below Upcoming that lists open GitHub pull requests auth
 
 ## Behavior
 
+- **Only renders in the sidebar if `gh` is on PATH** (detected once at startup via a `gh --version` probe). Users without gh never see the entry.
 - Appears in the sidebar immediately below Upcoming with a count badge (number of open PRs).
 - Mutually exclusive with Today and Upcoming — selecting one deactivates the others.
 - Backed by `gh search prs --author @me --state open --limit 100 --json ...`. Requires `gh` on the user's PATH and an authenticated session; no token is stored in ratatoist.

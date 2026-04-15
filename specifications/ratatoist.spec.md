@@ -18,7 +18,7 @@ A terminal UI client for Todoist. Lets users manage their tasks without leaving 
 
 ## Task Management
 
-- Complete / uncomplete (`x`) with optimistic UI — instant feedback, reverts on server error.
+- Complete / uncomplete (`x`) with optimistic UI — instant feedback, reverts on server error. Recurring tasks send `item_complete` (advances the series) and stay visible on the list; non-recurring tasks send `item_close` and flip to checked immediately.
 - Quick-add (`a`) with content, priority, due date, and project fields.
 - Inline field editing from the detail pane.
 - Priority picker popup.

@@ -1241,12 +1241,30 @@ impl App {
     }
 
     fn start_input(&mut self) {
-        let project_id = self
-            .projects
-            .get(self.selected_project)
-            .map(|p| p.id.clone())
-            .unwrap_or_default();
-        self.task_form = Some(TaskForm::new(project_id));
+        // From Today view the task has no "current project" — fall back to the
+        // user's Inbox and pre-fill the due date so submitting without
+        // touching it produces a task that shows up on Today.
+        let (project_id, default_due) = if self.today_view_active {
+            let inbox_id = self
+                .projects
+                .iter()
+                .find(|p| p.is_inbox())
+                .map(|p| p.id.clone())
+                .unwrap_or_default();
+            (inbox_id, "today")
+        } else {
+            let pid = self
+                .projects
+                .get(self.selected_project)
+                .map(|p| p.id.clone())
+                .unwrap_or_default();
+            (pid, "")
+        };
+        let mut form = TaskForm::new(project_id);
+        if !default_due.is_empty() {
+            form.due_string = default_due.to_string();
+        }
+        self.task_form = Some(form);
         self.show_input = true;
         self.input_buffer.clear();
         if let InputMode::Vim(_) = self.input_mode {
@@ -2371,5 +2389,50 @@ mod tests {
 
         assert!(args.get("due").is_none());
         assert!(args.get("due_string").is_none());
+    }
+
+    /// Adding a task from the Today view should pre-fill the Due date with
+    /// "today" and target the Inbox.
+    #[test]
+    fn add_from_today_view_defaults_to_today() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "inbox_1".to_string(),
+            name: "Inbox".to_string(),
+            inbox_project: Some(true),
+            ..Project::default()
+        });
+        app.projects.push(Project {
+            id: "proj_2".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.selected_project = 1;
+        app.activate_today_view();
+
+        app.start_input();
+
+        let form = app.task_form.as_ref().expect("form opens");
+        assert_eq!(form.due_string, "today", "Due date pre-fills to today");
+        assert_eq!(form.project_id, "inbox_1", "Today-view adds go to Inbox");
+    }
+
+    /// Adding from a regular project does NOT pre-fill the due date.
+    #[test]
+    fn add_from_project_keeps_due_empty() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "proj_1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.selected_project = 0;
+        // Today view NOT active.
+
+        app.start_input();
+
+        let form = app.task_form.as_ref().expect("form opens");
+        assert_eq!(form.due_string, "");
+        assert_eq!(form.project_id, "proj_1");
     }
 }

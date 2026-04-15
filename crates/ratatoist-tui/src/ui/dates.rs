@@ -42,7 +42,13 @@ pub fn format_due(due: &Due, theme: &Theme) -> FormattedDue {
 }
 
 fn display_label(due: &Due, days_away: i64) -> String {
-    if let Some(s) = &due.string
+    // For recurring tasks, show the next-occurrence date (today / tomorrow /
+    // weekday / short date) rather than the recurrence grammar ("every day").
+    // The ↻ icon already indicates recurrence; the date is what the user
+    // actually needs to see. For non-recurring tasks the `string` is the
+    // user's literal input (e.g. "10 Apr", "next friday") — keep that.
+    if !due.is_recurring
+        && let Some(s) = &due.string
         && !s.is_empty()
     {
         return s.clone();
@@ -52,6 +58,7 @@ fn display_label(due: &Due, days_away: i64) -> String {
         0 => "today".to_string(),
         1 => "tomorrow".to_string(),
         -1 => "yesterday".to_string(),
+        -6..=-2 | 2..=6 => weekday_name(&due.date).to_string(),
         _ => format_short_date(&due.date),
     }
 }
@@ -147,6 +154,62 @@ fn format_short_date(date_str: &str) -> String {
     ];
     let month = months.get(m as usize).unwrap_or(&"???");
     format!("{month} {d}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn due(date: &str, recurring: bool, string: Option<&str>) -> Due {
+        Due {
+            date: date.to_string(),
+            is_recurring: recurring,
+            timezone: None,
+            string: string.map(|s| s.to_string()),
+            datetime: None,
+            lang: None,
+        }
+    }
+
+    #[test]
+    fn recurring_today_shows_today_not_recurrence_string() {
+        let today = today_str();
+        let d = due(&today, true, Some("every day"));
+        assert_eq!(display_label(&d, 0), "today");
+    }
+
+    #[test]
+    fn recurring_tomorrow_shows_tomorrow() {
+        let d = due(&offset_days_str(1), true, Some("every day"));
+        assert_eq!(display_label(&d, 1), "tomorrow");
+    }
+
+    #[test]
+    fn recurring_midweek_shows_weekday() {
+        let d = due(&offset_days_str(3), true, Some("every Tue"));
+        let label = display_label(&d, 3);
+        // Should be a weekday name, not "every Tue".
+        assert!(
+            matches!(
+                label.as_str(),
+                "Sunday" | "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday"
+            ),
+            "got {label:?}"
+        );
+    }
+
+    #[test]
+    fn non_recurring_keeps_user_string() {
+        // User typed "10 Apr" — keep that verbatim.
+        let d = due("2026-04-10", false, Some("10 Apr"));
+        assert_eq!(display_label(&d, -5), "10 Apr");
+    }
+
+    #[test]
+    fn non_recurring_without_string_computes_label() {
+        let d = due("2026-04-10", false, None);
+        assert_eq!(display_label(&d, -5), "Friday");
+    }
 }
 
 fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {

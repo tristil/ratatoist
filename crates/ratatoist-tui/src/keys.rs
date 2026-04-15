@@ -559,6 +559,7 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                     ProjectNavItem::Project(i) => {
                         !app.today_view_active
                             && !app.upcoming_view_active
+                            && !app.github_prs_view_active
                             && app.folder_cursor.is_none()
                             && *i == app.selected_project
                     }

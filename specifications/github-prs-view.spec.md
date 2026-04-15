@@ -1,20 +1,22 @@
 # GitHub Pull Requests View
 
-A virtual sidebar entry below Upcoming that lists open GitHub pull requests authored by the current `gh` user. Read-only in v1.
+One virtual sidebar entry per GitHub owner (user or org) that has open pull requests authored by the current `gh` user. Read-only in v1.
 
 ## Behavior
 
-- **Only renders in the sidebar if `gh` is on PATH** (detected once at startup via a `gh --version` probe). Users without gh never see the entry.
-- Appears in the sidebar immediately below Upcoming with a count badge (number of open PRs).
-- Mutually exclusive with Today and Upcoming — selecting one deactivates the others.
-- Backed by `gh search prs --author @me --state open --limit 100 --json ...`. Requires `gh` on the user's PATH and an authenticated session; no token is stored in ratatoist.
-- Fetch happens on **view activation** and on **manual refresh** (`r` while the view is focused). No background polling, no refresh on every sync.
+- **Only renders in the sidebar if `gh` is on PATH** (detected once at startup via a `gh --version` probe). Users without gh never see any PR entry.
+- Fetch runs **once at app startup**: `gh search prs --author @me --state open --archived=false --limit 100 --json ...`. The sidebar populates with one entry per owner as soon as the response lands; before then, no PR entries appear.
+- One entry per owner, sorted alphabetically. An owner with zero open PRs gets no entry — so `cxrlos` shows up alongside `appfolio`, each with its own list. Personal accounts are just another owner.
+- Each sidebar row shows the owner name and an open-PR count badge for that owner.
+- Mutually exclusive with Today, Upcoming, and Jira Cards.
+- Archived repos are excluded (`--archived=false`) so unmergeable PRs don't linger.
+- A manual refresh (`r` while the view is focused) re-runs the fetch — useful after closing a PR. No background polling otherwise.
 - While the fetch is in flight the pane shows "Fetching pull requests…". If gh fails the stderr is surfaced in the pane with a "Press r to retry." hint.
-- Empty state: "No open pull requests."
+- Empty state within an org's view: "No open pull requests in this org."
 
 ## Display
 
-- PRs grouped by repository (`owner/name` heading).
+- PRs within an org view are grouped by repository (`owner/name` heading).
 - Each row shows: status icon (● open / ◌ draft), `#number`, title, `@author`, relative update time (`3h ago`, `2d ago`).
 - `j` / `k` (or arrow keys) navigate the list. Selection is visually highlighted; repo headers and blank rows are skipped.
 
@@ -22,7 +24,7 @@ A virtual sidebar entry below Upcoming that lists open GitHub pull requests auth
 
 - **`Enter`** — open the selected PR in the default browser via `gh pr view <url> --web`. No other interactions in v1.
 - **`r`** — re-run the gh fetch. Disabled while a fetch is already in progress.
-- **`Esc`** — returns focus to the sidebar (same as elsewhere).
+- **`Esc`** — returns focus to the sidebar.
 
 ## Non-goals (v1)
 

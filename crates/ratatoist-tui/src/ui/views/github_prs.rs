@@ -24,7 +24,9 @@ fn relative_time(iso: &str) -> Option<String> {
 pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
     let theme = app.theme();
 
-    if app.github_prs_loading && app.github_prs.is_empty() {
+    let prs = app.active_org_prs();
+
+    if app.github_prs_loading && prs.is_empty() {
         let lines = vec![
             ListItem::new(Line::default()),
             ListItem::new(Line::from(Span::styled(
@@ -57,11 +59,11 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         return;
     }
 
-    if app.github_prs.is_empty() {
+    if prs.is_empty() {
         let lines = vec![
             ListItem::new(Line::default()),
             ListItem::new(Line::from(Span::styled(
-                "No open pull requests.",
+                "No open pull requests in this org.",
                 theme.muted_text(),
             ))),
         ];
@@ -73,7 +75,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
     let mut current_repo: Option<String> = None;
     let mut visual_selected: Option<usize> = None;
 
-    for (pr_idx, pr) in app.github_prs.iter().enumerate() {
+    for (pr_idx, pr) in prs.iter().enumerate() {
         if current_repo.as_deref() != Some(pr.repo_full_name.as_str()) {
             if !items.is_empty() {
                 items.push(ListItem::new(Line::default()));

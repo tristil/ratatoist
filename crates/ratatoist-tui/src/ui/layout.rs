@@ -150,7 +150,7 @@ fn render_tasks_block(frame: &mut Frame, app: &App, area: Rect, active: bool) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.github_prs_view_active {
+    if app.is_pr_view_active() {
         let [hint_area, prs_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
         render_external_hint_row(frame, app, hint_area, app.github_prs_fetched_at, app.github_prs_loading);

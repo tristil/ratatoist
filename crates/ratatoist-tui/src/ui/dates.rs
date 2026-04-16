@@ -70,6 +70,20 @@ pub fn today_str() -> String {
         .to_string()
 }
 
+/// Current local hour (0..=23). Used by the "hide evening tasks until 5 PM"
+/// filter on the Today and All views.
+pub fn current_local_hour() -> u32 {
+    use chrono::Timelike;
+    chrono::Local::now().hour()
+}
+
+/// True when a task carries the `evening` label and the current local hour
+/// is before 17:00. Kept as a standalone predicate so tests can pass a
+/// specific hour without touching the clock.
+pub fn evening_task_hidden(labels: &[String], current_hour: u32) -> bool {
+    current_hour < 17 && labels.iter().any(|l| l == "evening")
+}
+
 /// Format a `YYYY-MM-DD` date as a section header for the Upcoming view,
 /// matching Todoist's style: `"15 Apr · Today · Wednesday"`,
 /// `"16 Apr · Tomorrow · Thursday"`, or `"17 Apr · Friday"` for dates farther
@@ -169,6 +183,27 @@ mod tests {
             datetime: None,
             lang: None,
         }
+    }
+
+    #[test]
+    fn evening_label_hidden_before_5pm_and_visible_after() {
+        let evening = vec!["evening".to_string()];
+        let other = vec!["work".to_string()];
+        let none: Vec<String> = vec![];
+
+        // Before 17:00 — evening hidden, others visible.
+        assert!(evening_task_hidden(&evening, 9));
+        assert!(evening_task_hidden(&evening, 16));
+        assert!(!evening_task_hidden(&other, 9));
+        assert!(!evening_task_hidden(&none, 9));
+
+        // At/after 17:00 — nothing hidden by this rule.
+        assert!(!evening_task_hidden(&evening, 17));
+        assert!(!evening_task_hidden(&evening, 20));
+
+        // Exact lowercase only — "Evening" is not matched.
+        let capitalized = vec!["Evening".to_string()];
+        assert!(!evening_task_hidden(&capitalized, 9));
     }
 
     #[test]

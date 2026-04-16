@@ -1492,11 +1492,15 @@ impl App {
 
         // Today tasks (same filter as Today view, minus overdue-collapse).
         let today = crate::ui::dates::today_str();
+        let current_hour = crate::ui::dates::current_local_hour();
         for (i, t) in self.tasks.iter().enumerate() {
             if t.is_deleted || t.checked || t.parent_id.is_some() {
                 continue;
             }
             if self.pending_close_recurring.contains(&t.id) {
+                continue;
+            }
+            if crate::ui::dates::evening_task_hidden(&t.labels, current_hour) {
                 continue;
             }
             let due_today_or_overdue = t
@@ -2632,6 +2636,7 @@ impl App {
     pub fn visible_tasks(&self) -> Vec<&Task> {
         if self.today_view_active {
             let today = crate::ui::dates::today_str();
+            let current_hour = crate::ui::dates::current_local_hour();
             let mut tasks: Vec<&Task> = self
                 .tasks
                 .iter()
@@ -2640,6 +2645,9 @@ impl App {
                         return false;
                     }
                     if self.pending_close_recurring.contains(&t.id) {
+                        return false;
+                    }
+                    if crate::ui::dates::evening_task_hidden(&t.labels, current_hour) {
                         return false;
                     }
                     let is_today_or_overdue = t

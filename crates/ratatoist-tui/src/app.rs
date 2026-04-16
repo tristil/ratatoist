@@ -746,7 +746,10 @@ impl App {
             jira_cards_fetched_at: None,
             selected_jira_card: 0,
             acli_available: binary_available("acli"),
-            all_view_active: false,
+            // Start on the All view — it's the primary landing page (first
+            // sidebar entry) and surfaces Today's tasks, open PRs, and Jira
+            // cards in one place.
+            all_view_active: true,
             selected_all_item: 0,
             overdue_section_collapsed: false,
             last_activity: Instant::now(),

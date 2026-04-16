@@ -4,7 +4,7 @@ A combined dashboard sidebar entry that merges Today tasks, non-hidden GitHub PR
 
 ## Behavior
 
-- Appears first among the virtual entries (before Today) with a count badge totalling all items.
+- Appears at the **top of the sidebar** — above the personal header and Inbox — with a count badge totalling all items.
 - Sections render in order: **Today** tasks, **Pull Requests** (non-hidden orgs), **Jira Cards**, each under a bold header row (`▸ Today`, `▸ Pull Requests`, `▸ Jira Cards`). Empty sections are omitted.
 - `j` / `k` navigate across sections seamlessly. Section headers and spacers are skipped by the cursor.
 

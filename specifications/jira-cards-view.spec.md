@@ -15,7 +15,7 @@ A virtual sidebar entry below Pull Requests that lists open Jira work items assi
     --limit 100 --json
   ```
   No token is stored in ratatoist; it uses whatever `acli jira auth login` has configured.
-- Fetch happens on **view activation** and on **manual refresh** (`r` key while focused). No background polling.
+- Fetch runs at app startup and then **polls in the background every `jira_cards_poll_interval_secs` seconds** (default **10s**, minimum 5s). Idle-gated: if the user is idle past `idle_timeout_secs`, the poll is deferred and fires on their next keystroke. Manual `r` still triggers an immediate fetch.
 - Loading / error / empty states render in the pane:
   - **Loading:** "Fetching Jira cards…"
   - **Error:** stderr from acli is surfaced, with a hint to run `acli jira auth login` if unauthenticated.

@@ -907,6 +907,7 @@ impl App {
                     KeyAction::OpenAllFolds => self.collapsed.clear(),
                     KeyAction::CloseAllFolds => self.close_all_folds(),
                     KeyAction::CompleteTask => self.complete_selected_task(),
+                    KeyAction::CompleteTaskById(id) => self.complete_task_by_id(id),
                     KeyAction::OpenPriorityPicker => {
                         if let Some(task) = self.selected_task() {
                             self.priority_selection = task.priority;
@@ -1714,22 +1715,50 @@ impl App {
         self.flush_commands();
     }
 
+    /// Complete a task addressed by its ID, bypassing the `selected_task` +
+    /// `visible_tasks()` lookup. Used by the All view, whose item list spans
+    /// tasks that aren't in the current project-scoped `visible_tasks()`.
+    /// Clamps `selected_all_item` since the completed task is filtered out
+    /// of the All view after the optimistic update.
+    fn complete_task_by_id(&mut self, task_id: String) {
+        self.enqueue_complete_task_by_id(task_id);
+        let new_len = self.all_view_items().len();
+        if new_len > 0 && self.selected_all_item >= new_len {
+            self.selected_all_item = new_len - 1;
+        }
+        self.flush_commands();
+    }
+
     /// Enqueue the complete/reopen command for the selected task and apply
     /// the optimistic UI update. Split out so tests can inspect the enqueued
     /// command without flushing (which spawns a tokio task and drains the
     /// pending queue).
     fn enqueue_complete_selected(&mut self) {
-        let (task_id, was_checked, is_recurring) = {
+        let task_id = {
             let visible = self.visible_tasks();
             let Some(task) = visible.get(self.selected_task) else {
                 return;
             };
-            (
-                task.id.clone(),
-                task.checked,
-                task.due.as_ref().map(|d| d.is_recurring).unwrap_or(false),
-            )
+            task.id.clone()
         };
+
+        self.enqueue_complete_task_by_id(task_id);
+
+        let new_len = self.visible_tasks().len();
+        if new_len > 0 && self.selected_task >= new_len {
+            self.selected_task = new_len - 1;
+        }
+    }
+
+    /// Core of the complete/reopen flow: apply the optimistic update and
+    /// enqueue the sync command for the given task ID. Caller is responsible
+    /// for any view-specific selection clamping and for flushing.
+    fn enqueue_complete_task_by_id(&mut self, task_id: String) {
+        let Some(task) = self.tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        let was_checked = task.checked;
+        let is_recurring = task.due.as_ref().map(|d| d.is_recurring).unwrap_or(false);
 
         let before = self.tasks.iter().find(|t| t.id == task_id).cloned();
 
@@ -1746,11 +1775,6 @@ impl App {
             self.pending_close_recurring.insert(task_id.clone());
         } else if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
             t.checked = !was_checked;
-        }
-
-        let new_len = self.visible_tasks().len();
-        if new_len > 0 && self.selected_task >= new_len {
-            self.selected_task = new_len - 1;
         }
 
         // item_close is the command that mirrors the official Todoist UI:
@@ -3115,6 +3139,7 @@ mod tests {
             KeyAction::FormEditField => app.form_edit_field(),
             KeyAction::FormEscNormal => app.submit_input(),
             KeyAction::CancelInput => app.cancel_input(),
+            KeyAction::CompleteTaskById(id) => app.complete_task_by_id(id),
             KeyAction::Consumed | KeyAction::None => {}
             _ => panic!("unexpected key action in test"),
         }
@@ -3345,6 +3370,74 @@ mod tests {
         assert!(
             !app.tasks[0].checked,
             "recurring task must stay unchecked after optimistic complete"
+        );
+        assert_eq!(pending_cmd_types(&app), vec!["item_close".to_string()]);
+    }
+
+    /// Regression: pressing `x` on a Todoist task in the All view must
+    /// complete *that specific task*, addressed by ID. Previously the
+    /// handler routed through `selected_task` + `visible_tasks()`, but on
+    /// the All view `visible_tasks()` is project-scoped — so the index
+    /// referred to the wrong task (or was out of range, doing nothing).
+    #[test]
+    fn all_view_x_completes_task_by_id() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        // A task in the currently-selected project, NOT due today — this
+        // is what `visible_tasks()` returns on the All view. If the old
+        // index-based path is used, this is what gets completed by mistake.
+        app.tasks.push(Task {
+            id: "wrong".to_string(),
+            content: "Not due today".to_string(),
+            project_id: "p1".to_string(),
+            ..Task::default()
+        });
+        // A task due today — this is what should appear in the All view
+        // and what should actually get completed when `x` is pressed.
+        app.tasks.push(Task {
+            id: "right".to_string(),
+            content: "Due today".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                is_recurring: false,
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.selected_project = 0;
+        app.activate_all_view();
+        app.active_pane = Pane::Tasks;
+        app.selected_all_item = 0;
+
+        // Sanity: the All view shows exactly one task — "right".
+        let items = app.all_view_items();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], AllViewItem::Task(_)));
+
+        // Dispatch `x` through the real key handler.
+        let action =
+            keys::handle_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        match action {
+            KeyAction::CompleteTaskById(id) => {
+                assert_eq!(id, "right", "handler resolved the correct task ID");
+                app.enqueue_complete_task_by_id(id);
+            }
+            _ => panic!("expected CompleteTaskById"),
+        }
+
+        // "right" was completed optimistically; "wrong" is untouched.
+        assert!(
+            app.tasks.iter().find(|t| t.id == "right").unwrap().checked,
+            "Due-today task was marked complete"
+        );
+        assert!(
+            !app.tasks.iter().find(|t| t.id == "wrong").unwrap().checked,
+            "Project task outside All view must not be touched"
         );
         assert_eq!(pending_cmd_types(&app), vec!["item_close".to_string()]);
     }

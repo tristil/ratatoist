@@ -17,6 +17,7 @@ pub enum KeyAction {
     OpenAllFolds,
     CloseAllFolds,
     CompleteTask,
+    CompleteTaskById(String),
     #[allow(dead_code)]
     OpenPriorityPicker,
     SelectPriority,
@@ -386,10 +387,15 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
         }
 
         KeyCode::Char('x') if matches!(app.active_pane, Pane::Tasks) && app.all_view_active => {
+            // The All view's `visible_tasks()` is project-scoped, so we can't
+            // rely on `selected_task` + `visible_tasks()` lookup here. Resolve
+            // the task's ID directly from the raw `self.tasks` index stored in
+            // `AllViewItem::Task(i)` and complete by ID.
             let items = app.all_view_items();
-            if let Some(crate::app::AllViewItem::Task(i)) = items.get(app.selected_all_item) {
-                app.selected_task = *i;
-                KeyAction::CompleteTask
+            if let Some(crate::app::AllViewItem::Task(i)) = items.get(app.selected_all_item)
+                && let Some(task) = app.tasks.get(*i)
+            {
+                KeyAction::CompleteTaskById(task.id.clone())
             } else {
                 KeyAction::Consumed
             }

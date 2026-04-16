@@ -467,6 +467,12 @@ pub struct App {
     pub acli_available: bool,
     pub all_view_active: bool,
     pub selected_all_item: usize,
+    /// When the detail pane is open, this is the ID of the task being
+    /// displayed. Set by `open_detail` / `open_detail_for`, cleared on
+    /// `CloseDetail`. `selected_task()` prefers this over the
+    /// `selected_task` index so detail opened from the All view (where
+    /// `visible_tasks()` is project-scoped) still resolves correctly.
+    pub detail_task_id: Option<String>,
     pub overdue_section_collapsed: bool,
     last_activity: Instant,
     pending_ws_sync: bool,
@@ -751,6 +757,7 @@ impl App {
             // cards in one place.
             all_view_active: true,
             selected_all_item: 0,
+            detail_task_id: None,
             overdue_section_collapsed: false,
             last_activity: Instant::now(),
             pending_ws_sync: false,
@@ -894,6 +901,7 @@ impl App {
                     KeyAction::CloseDetail => {
                         self.active_pane = Pane::Tasks;
                         self.detail_scroll = 0;
+                        self.detail_task_id = None;
                     }
                     KeyAction::ToggleSettings => {
                         self.show_settings = !self.show_settings;
@@ -911,6 +919,7 @@ impl App {
                     KeyAction::CloseAllFolds => self.close_all_folds(),
                     KeyAction::CompleteTask => self.complete_selected_task(),
                     KeyAction::CompleteTaskById(id) => self.complete_task_by_id(id),
+                    KeyAction::OpenDetailById(id) => self.open_detail_for(id),
                     KeyAction::OpenPriorityPicker => {
                         if let Some(task) = self.selected_task() {
                             self.priority_selection = task.priority;
@@ -1390,29 +1399,44 @@ impl App {
     }
 
     fn open_detail(&mut self) {
-        let visible = self.visible_tasks();
-        if let Some(task) = visible.get(self.selected_task) {
-            let task_id = task.id.clone();
-            let task_project_id = task.project_id.clone();
-
-            if self.dock_filter.is_some()
-                && let Some(pos) = self.projects.iter().position(|p| p.id == task_project_id)
-            {
-                self.selected_project = pos;
+        let task_id = {
+            let visible = self.visible_tasks();
+            match visible.get(self.selected_task) {
+                Some(t) => t.id.clone(),
+                None => return,
             }
+        };
+        self.open_detail_for(task_id);
+    }
 
-            self.active_pane = Pane::Detail;
-            self.detail_scroll = 0;
-            self.detail_field = 0;
+    /// Open the detail pane for a specific task ID. Used by the All view,
+    /// where the visible-tasks index isn't a valid handle for the selected
+    /// task. Shared by the regular `open_detail` path too, so both flows go
+    /// through the same setup.
+    fn open_detail_for(&mut self, task_id: String) {
+        let task_project_id = match self.tasks.iter().find(|t| t.id == task_id) {
+            Some(t) => t.project_id.clone(),
+            None => return,
+        };
 
-            // Serve cached comments immediately, refresh in background.
-            if let Some(cached) = self.comments_by_task.get(&task_id) {
-                self.comments = cached.clone();
-            } else {
-                self.comments.clear();
-            }
-            self.spawn_comments_fetch(task_id);
+        if self.dock_filter.is_some()
+            && let Some(pos) = self.projects.iter().position(|p| p.id == task_project_id)
+        {
+            self.selected_project = pos;
         }
+
+        self.detail_task_id = Some(task_id.clone());
+        self.active_pane = Pane::Detail;
+        self.detail_scroll = 0;
+        self.detail_field = 0;
+
+        // Serve cached comments immediately, refresh in background.
+        if let Some(cached) = self.comments_by_task.get(&task_id) {
+            self.comments = cached.clone();
+        } else {
+            self.comments.clear();
+        }
+        self.spawn_comments_fetch(task_id);
     }
 
     fn spawn_comments_fetch(&mut self, task_id: String) {
@@ -1666,8 +1690,15 @@ impl App {
     }
 
     pub fn open_selected_pr_in_browser(&mut self) {
-        let filtered = self.active_org_prs();
-        let Some(pr) = filtered.get(self.selected_pr) else {
+        // On the All view `selected_pr` is a raw `self.github_prs` index;
+        // inside a PR-org view it indexes into the filtered
+        // `active_org_prs()` list. Same key-action, two contexts.
+        let pr = if self.all_view_active {
+            self.github_prs.get(self.selected_pr)
+        } else {
+            self.active_org_prs().get(self.selected_pr).copied()
+        };
+        let Some(pr) = pr else {
             return;
         };
         let url = pr.url.clone();
@@ -2537,6 +2568,13 @@ impl App {
     }
 
     pub fn selected_task(&self) -> Option<&Task> {
+        // When the detail pane is open, honor the task ID it was opened
+        // with. This is what makes "Enter on a Todoist task in the All
+        // view" work correctly, since the All view doesn't populate
+        // `visible_tasks()` with that task.
+        if let Some(id) = &self.detail_task_id {
+            return self.tasks.iter().find(|t| t.id == *id);
+        }
         let visible = self.visible_tasks();
         visible.get(self.selected_task).copied()
     }
@@ -3143,6 +3181,7 @@ mod tests {
             KeyAction::FormEscNormal => app.submit_input(),
             KeyAction::CancelInput => app.cancel_input(),
             KeyAction::CompleteTaskById(id) => app.complete_task_by_id(id),
+            KeyAction::OpenDetailById(id) => app.open_detail_for(id),
             KeyAction::Consumed | KeyAction::None => {}
             _ => panic!("unexpected key action in test"),
         }
@@ -3443,6 +3482,71 @@ mod tests {
             "Project task outside All view must not be touched"
         );
         assert_eq!(pending_cmd_types(&app), vec!["item_close".to_string()]);
+    }
+
+    /// Regression: pressing Enter on a Todoist task in the All view must
+    /// open the detail pane for *that* task, not the task that happens to
+    /// share the index in the project-scoped `visible_tasks()`. Verified by
+    /// putting the All-view task in a project that isn't selected, so the
+    /// project-scoped list wouldn't surface it.
+    ///
+    /// Uses `#[tokio::test]` because `open_detail_for` spawns a background
+    /// comments fetch.
+    #[tokio::test]
+    async fn all_view_enter_opens_detail_for_the_right_task() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p_selected".to_string(),
+            name: "Selected".to_string(),
+            ..Project::default()
+        });
+        app.projects.push(Project {
+            id: "p_other".to_string(),
+            name: "Other".to_string(),
+            ..Project::default()
+        });
+        // Task that populates visible_tasks() when p_selected is the
+        // selected project — the old bug would open *this* task.
+        app.tasks.push(Task {
+            id: "visible_but_wrong".to_string(),
+            content: "In selected project, not due today".to_string(),
+            project_id: "p_selected".to_string(),
+            ..Task::default()
+        });
+        // Task that only appears on the All view (different project, due today).
+        app.tasks.push(Task {
+            id: "all_view_task".to_string(),
+            content: "Due today elsewhere".to_string(),
+            project_id: "p_other".to_string(),
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                is_recurring: false,
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.selected_project = 0; // p_selected
+        app.activate_all_view();
+        app.active_pane = Pane::Tasks;
+        app.selected_all_item = 0;
+
+        let action =
+            keys::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match action {
+            KeyAction::OpenDetailById(id) => {
+                assert_eq!(id, "all_view_task");
+                app.open_detail_for(id);
+            }
+            _ => panic!("expected OpenDetailById"),
+        }
+
+        assert_eq!(app.detail_task_id.as_deref(), Some("all_view_task"));
+        assert!(matches!(app.active_pane, Pane::Detail));
+        assert_eq!(
+            app.selected_task().map(|t| t.id.as_str()),
+            Some("all_view_task"),
+            "selected_task() must resolve via detail_task_id, not visible_tasks"
+        );
     }
 
     /// Completing a non-recurring task flips to checked immediately for

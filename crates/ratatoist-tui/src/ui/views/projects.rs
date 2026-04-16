@@ -17,6 +17,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
                 && *i == app.selected_project
         }
         ProjectEntry::FolderHeader(fi) => app.folder_cursor == Some(*fi),
+        ProjectEntry::AllView => app.all_view_active && app.folder_cursor.is_none(),
         ProjectEntry::TodayView => app.today_view_active && app.folder_cursor.is_none(),
         ProjectEntry::UpcomingView => app.upcoming_view_active && app.folder_cursor.is_none(),
         ProjectEntry::GithubPrsView(owner) => {
@@ -63,6 +64,19 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
             }
 
             ProjectEntry::Separator => ListItem::new(Line::default()),
+
+            ProjectEntry::AllView => {
+                let count = app.all_view_items().len();
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled("☰ ", Style::default().fg(Color::White)),
+                    Span::styled("All", theme.normal_text()),
+                ];
+                if count > 0 {
+                    spans.push(Span::styled(format!("  {count}"), theme.muted_text()));
+                }
+                ListItem::new(Line::from(spans))
+            }
 
             ProjectEntry::TodayView => {
                 let stats = app.overview_stats();

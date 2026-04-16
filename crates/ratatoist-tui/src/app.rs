@@ -308,6 +308,7 @@ pub enum ProjectEntry {
     FolderHeader(usize),
     Project(usize),
     Separator,
+    AllView,
     TodayView,
     UpcomingView,
     /// One entry per GitHub owner (user or org) that has at least one open PR.
@@ -319,10 +320,21 @@ pub enum ProjectEntry {
 pub enum ProjectNavItem {
     Folder(usize),
     Project(usize),
+    AllView,
     TodayView,
     UpcomingView,
     GithubPrsView(String),
     JiraCardsView,
+}
+
+/// A tagged item in the All view. The usize is an index into the source
+/// collection (visible_tasks() for tasks, github_prs for PRs, jira_cards
+/// for Jira cards) at the time the vec was built.
+#[derive(Debug, Clone, Copy)]
+pub enum AllViewItem {
+    Task(usize),
+    PullRequest(usize),
+    JiraCard(usize),
 }
 
 /// Check whether a CLI tool is on PATH and responds to `--version`. Runs once
@@ -453,6 +465,8 @@ pub struct App {
     pub jira_cards_fetched_at: Option<chrono::DateTime<Local>>,
     pub selected_jira_card: usize,
     pub acli_available: bool,
+    pub all_view_active: bool,
+    pub selected_all_item: usize,
     pub overdue_section_collapsed: bool,
     last_activity: Instant,
     pending_ws_sync: bool,
@@ -685,6 +699,8 @@ impl App {
             jira_cards_fetched_at: None,
             selected_jira_card: 0,
             acli_available: binary_available("acli"),
+            all_view_active: false,
+            selected_all_item: 0,
             overdue_section_collapsed: false,
             last_activity: Instant::now(),
             pending_ws_sync: false,
@@ -792,12 +808,14 @@ impl App {
                         self.running = false;
                     }
                     KeyAction::ProjectChanged => self.switch_to_project_tasks(),
+                    KeyAction::AllViewSelected => self.activate_all_view(),
                     KeyAction::TodayViewSelected => self.activate_today_view(),
                     KeyAction::UpcomingViewSelected => self.activate_upcoming_view(),
                     KeyAction::RefreshGithubPrs => self.refresh_github_prs(),
                     KeyAction::OpenSelectedPrInBrowser => self.open_selected_pr_in_browser(),
                     KeyAction::JiraCardsViewSelected => self.activate_jira_cards_view(),
                     KeyAction::RefreshJiraCards => self.refresh_jira_cards(),
+                    KeyAction::RefreshAllSources => self.refresh_all_sources(),
                     KeyAction::OpenSelectedJiraCardInBrowser => {
                         self.open_selected_jira_card_in_browser()
                     }
@@ -1361,11 +1379,75 @@ impl App {
         });
     }
 
+    pub fn activate_all_view(&mut self) {
+        tracing::debug!("all view activated");
+        self.all_view_active = true;
+        self.today_view_active = false;
+        self.upcoming_view_active = false;
+        self.active_pr_org = None;
+        self.jira_cards_view_active = false;
+        self.selected_all_item = 0;
+    }
+
+    /// Build the combined item list for the All view. Today tasks first, then
+    /// non-hidden PRs, then Jira cards. Indices point into the respective
+    /// source collections at call time.
+    pub fn all_view_items(&self) -> Vec<AllViewItem> {
+        let mut items = Vec::new();
+
+        // Today tasks (same filter as Today view, minus overdue-collapse).
+        let today = crate::ui::dates::today_str();
+        for (i, t) in self.tasks.iter().enumerate() {
+            if t.is_deleted || t.checked || t.parent_id.is_some() {
+                continue;
+            }
+            if self.pending_close_recurring.contains(&t.id) {
+                continue;
+            }
+            let due_today_or_overdue = t
+                .due
+                .as_ref()
+                .is_some_and(|d| d.date.as_str() <= today.as_str());
+            if !due_today_or_overdue {
+                continue;
+            }
+            match &t.responsible_uid {
+                None => {}
+                Some(uid) if self.current_user_id.as_deref() == Some(uid.as_str()) => {}
+                _ => continue,
+            }
+            items.push(AllViewItem::Task(i));
+        }
+
+        // Non-hidden PRs.
+        for (i, pr) in self.github_prs.iter().enumerate() {
+            if let Some((owner, _)) = pr.repo_full_name.split_once('/')
+                && self.hidden_pr_orgs.contains(owner)
+            {
+                continue;
+            }
+            items.push(AllViewItem::PullRequest(i));
+        }
+
+        // Jira cards.
+        for (i, _) in self.jira_cards.iter().enumerate() {
+            items.push(AllViewItem::JiraCard(i));
+        }
+
+        items
+    }
+
+    pub fn refresh_all_sources(&mut self) {
+        self.spawn_github_prs_fetch();
+        self.spawn_jira_cards_fetch();
+    }
+
     fn switch_to_project_tasks(&mut self) {
         self.today_view_active = false;
         self.upcoming_view_active = false;
         self.active_pr_org = None;
         self.jira_cards_view_active = false;
+        self.all_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
     }
@@ -1376,6 +1458,7 @@ impl App {
         self.upcoming_view_active = false;
         self.active_pr_org = None;
         self.jira_cards_view_active = false;
+        self.all_view_active = false;
         self.overdue_section_collapsed = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
@@ -1405,6 +1488,7 @@ impl App {
         self.upcoming_view_active = true;
         self.active_pr_org = None;
         self.jira_cards_view_active = false;
+        self.all_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
     }
@@ -1415,6 +1499,7 @@ impl App {
         self.upcoming_view_active = false;
         self.active_pr_org = Some(owner);
         self.jira_cards_view_active = false;
+        self.all_view_active = false;
         self.selected_pr = 0;
         // No fetch here — the initial fetch runs once on App::new().
         // Manual refresh via the `r` key still works.
@@ -1426,6 +1511,7 @@ impl App {
         self.upcoming_view_active = false;
         self.active_pr_org = None;
         self.jira_cards_view_active = true;
+        self.all_view_active = false;
         self.selected_jira_card = 0;
         self.spawn_jira_cards_fetch();
     }
@@ -2017,6 +2103,7 @@ impl App {
                 let is_inbox = self.projects[i].is_inbox();
                 entries.push(ProjectEntry::Project(i));
                 if is_inbox {
+                    entries.push(ProjectEntry::AllView);
                     entries.push(ProjectEntry::TodayView);
                     entries.push(ProjectEntry::UpcomingView);
                     // One Pull Requests entry per GitHub owner that has open
@@ -2067,6 +2154,7 @@ impl App {
             .filter_map(|e| match e {
                 ProjectEntry::FolderHeader(fi) => Some(ProjectNavItem::Folder(fi)),
                 ProjectEntry::Project(i) => Some(ProjectNavItem::Project(i)),
+                ProjectEntry::AllView => Some(ProjectNavItem::AllView),
                 ProjectEntry::TodayView => Some(ProjectNavItem::TodayView),
                 ProjectEntry::UpcomingView => Some(ProjectNavItem::UpcomingView),
                 ProjectEntry::GithubPrsView(owner) => Some(ProjectNavItem::GithubPrsView(owner)),
@@ -2241,7 +2329,8 @@ impl App {
     /// currently active and the underlying `selected_project` should be
     /// ignored for display, navigation, or add-task defaults.
     pub fn on_virtual_view(&self) -> bool {
-        self.today_view_active
+        self.all_view_active
+            || self.today_view_active
             || self.upcoming_view_active
             || self.active_pr_org.is_some()
             || self.jira_cards_view_active
@@ -2284,6 +2373,9 @@ impl App {
     }
 
     pub fn selected_project_name(&self) -> std::borrow::Cow<'_, str> {
+        if self.all_view_active {
+            return "All".into();
+        }
         if self.today_view_active {
             return "Today".into();
         }

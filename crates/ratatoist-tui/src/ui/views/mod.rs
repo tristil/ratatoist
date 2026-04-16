@@ -1,3 +1,4 @@
+pub mod all;
 pub mod detail;
 pub mod github_prs;
 pub mod jira_cards;

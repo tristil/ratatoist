@@ -38,6 +38,8 @@ pub enum KeyAction {
     OpenThemePicker,
     SelectTheme,
     CloseThemePicker,
+    AllViewSelected,
+    RefreshAllSources,
     TodayViewSelected,
     UpcomingViewSelected,
     RefreshGithubPrs,
@@ -383,10 +385,24 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
             KeyAction::Consumed
         }
 
+        KeyCode::Char('x') if matches!(app.active_pane, Pane::Tasks) && app.all_view_active => {
+            let items = app.all_view_items();
+            if let Some(crate::app::AllViewItem::Task(i)) = items.get(app.selected_all_item) {
+                app.selected_task = *i;
+                KeyAction::CompleteTask
+            } else {
+                KeyAction::Consumed
+            }
+        }
         KeyCode::Char('x') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CompleteTask,
         KeyCode::Char('a') if matches!(app.active_pane, Pane::Tasks) => KeyAction::StartInput,
         KeyCode::Char('f') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CycleFilter,
         KeyCode::Char('o') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CycleSort,
+        KeyCode::Char('r')
+            if matches!(app.active_pane, Pane::Tasks) && app.all_view_active =>
+        {
+            KeyAction::RefreshAllSources
+        }
         KeyCode::Char('r')
             if matches!(app.active_pane, Pane::Tasks) && app.is_pr_view_active() =>
         {
@@ -443,6 +459,24 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
                 app.active_pane = Pane::Tasks;
                 KeyAction::Consumed
             }
+            Pane::Tasks if app.all_view_active => {
+                let items = app.all_view_items();
+                match items.get(app.selected_all_item) {
+                    Some(crate::app::AllViewItem::Task(i)) => {
+                        app.selected_task = *i;
+                        KeyAction::OpenDetail
+                    }
+                    Some(crate::app::AllViewItem::PullRequest(i)) => {
+                        app.selected_pr = *i;
+                        KeyAction::OpenSelectedPrInBrowser
+                    }
+                    Some(crate::app::AllViewItem::JiraCard(i)) => {
+                        app.selected_jira_card = *i;
+                        KeyAction::OpenSelectedJiraCardInBrowser
+                    }
+                    None => KeyAction::Consumed,
+                }
+            }
             Pane::Tasks if app.is_pr_view_active() => KeyAction::OpenSelectedPrInBrowser,
             Pane::Tasks if app.jira_cards_view_active => KeyAction::OpenSelectedJiraCardInBrowser,
             Pane::Tasks => KeyAction::OpenDetail,
@@ -495,6 +529,17 @@ fn handle_standard(app: &mut App, key: KeyEvent) -> KeyAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('a') if matches!(app.active_pane, Pane::Tasks) => KeyAction::StartInput,
+            KeyCode::Char('x')
+                if matches!(app.active_pane, Pane::Tasks) && app.all_view_active =>
+            {
+                let items = app.all_view_items();
+                if let Some(crate::app::AllViewItem::Task(i)) = items.get(app.selected_all_item) {
+                    app.selected_task = *i;
+                    KeyAction::CompleteTask
+                } else {
+                    KeyAction::Consumed
+                }
+            }
             KeyCode::Char('x') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CompleteTask,
             _ => KeyAction::None,
         };
@@ -540,6 +585,24 @@ fn handle_standard(app: &mut App, key: KeyEvent) -> KeyAction {
                 app.active_pane = Pane::Tasks;
                 KeyAction::Consumed
             }
+            Pane::Tasks if app.all_view_active => {
+                let items = app.all_view_items();
+                match items.get(app.selected_all_item) {
+                    Some(crate::app::AllViewItem::Task(i)) => {
+                        app.selected_task = *i;
+                        KeyAction::OpenDetail
+                    }
+                    Some(crate::app::AllViewItem::PullRequest(i)) => {
+                        app.selected_pr = *i;
+                        KeyAction::OpenSelectedPrInBrowser
+                    }
+                    Some(crate::app::AllViewItem::JiraCard(i)) => {
+                        app.selected_jira_card = *i;
+                        KeyAction::OpenSelectedJiraCardInBrowser
+                    }
+                    None => KeyAction::Consumed,
+                }
+            }
             Pane::Tasks if app.is_pr_view_active() => KeyAction::OpenSelectedPrInBrowser,
             Pane::Tasks if app.jira_cards_view_active => KeyAction::OpenSelectedJiraCardInBrowser,
             Pane::Tasks => KeyAction::OpenDetail,
@@ -581,6 +644,9 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                             && *i == app.selected_project
                     }
                     ProjectNavItem::Folder(fi) => app.folder_cursor == Some(*fi),
+                    ProjectNavItem::AllView => {
+                        app.all_view_active && app.folder_cursor.is_none()
+                    }
                     ProjectNavItem::TodayView => {
                         app.today_view_active && app.folder_cursor.is_none()
                     }
@@ -616,6 +682,10 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                     app.folder_cursor = Some(*fi);
                     KeyAction::Consumed
                 }
+                ProjectNavItem::AllView => {
+                    app.folder_cursor = None;
+                    KeyAction::AllViewSelected
+                }
                 ProjectNavItem::TodayView => {
                     app.folder_cursor = None;
                     KeyAction::TodayViewSelected
@@ -637,6 +707,15 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
             }
         }
         Pane::Tasks => {
+            if app.all_view_active {
+                let len = app.all_view_items().len();
+                if len == 0 {
+                    return KeyAction::Consumed;
+                }
+                let current = app.selected_all_item as i32;
+                app.selected_all_item = (current + delta).rem_euclid(len as i32) as usize;
+                return KeyAction::Consumed;
+            }
             if app.jira_cards_view_active {
                 let len = app.jira_cards.len();
                 if len == 0 {
@@ -692,6 +771,10 @@ fn jump_to_edge(app: &mut App, top: bool) -> KeyAction {
                 }
                 Some(ProjectNavItem::Folder(fi)) => {
                     app.folder_cursor = Some(*fi);
+                }
+                Some(ProjectNavItem::AllView) => {
+                    app.folder_cursor = None;
+                    return KeyAction::AllViewSelected;
                 }
                 Some(ProjectNavItem::TodayView) => {
                     app.folder_cursor = None;

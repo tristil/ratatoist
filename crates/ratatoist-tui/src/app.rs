@@ -470,6 +470,14 @@ pub struct App {
     pub overdue_section_collapsed: bool,
     last_activity: Instant,
     pending_ws_sync: bool,
+    /// Background poll interval for `gh search prs` (seconds). GitHub allows
+    /// 5000 authed REST requests/hour, well above any reasonable polling
+    /// cadence for a personal tool, so this is a comfort knob, not a safety
+    /// knob. Default 300s = 5 minutes.
+    pub github_prs_poll_interval_secs: u64,
+    /// Set when we'd have polled PRs but the user is idle; fired on the next
+    /// keystroke (same pattern as `pending_ws_sync`).
+    pending_pr_poll: bool,
     comments_fetch_seq: u64,
     websocket_url: Option<String>,
     pending_commands: Vec<SyncCommand>,
@@ -513,6 +521,24 @@ fn load_hidden_pr_orgs() -> HashSet<String> {
             .collect();
     }
     HashSet::new()
+}
+
+/// Default background poll interval for `gh search prs`. GitHub's search
+/// endpoint rate-limits authenticated users to 30 req/min, so 10 seconds
+/// (6/min) is comfortably under and keeps the PR view near-real-time.
+const DEFAULT_GITHUB_PRS_POLL_INTERVAL_SECS: u64 = 10;
+
+fn load_github_prs_poll_interval_secs() -> u64 {
+    let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
+    if let Ok(src) = std::fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&src)
+        && let Some(secs) = val["github_prs_poll_interval_secs"].as_u64()
+    {
+        // Clamp to at least 5s to avoid accidentally DoS'ing the search
+        // endpoint if the user sets a tiny value by mistake.
+        return secs.max(5);
+    }
+    DEFAULT_GITHUB_PRS_POLL_INTERVAL_SECS
 }
 
 fn load_idle_timeout_secs() -> u64 {
@@ -596,6 +622,7 @@ impl App {
             "theme": name,
             "idle_timeout_secs": self.idle_timeout_secs,
             "hidden_pr_orgs": hidden,
+            "github_prs_poll_interval_secs": self.github_prs_poll_interval_secs,
         });
         let _ = std::fs::write(
             &path,
@@ -704,6 +731,8 @@ impl App {
             overdue_section_collapsed: false,
             last_activity: Instant::now(),
             pending_ws_sync: false,
+            github_prs_poll_interval_secs: load_github_prs_poll_interval_secs(),
+            pending_pr_poll: false,
             comments_fetch_seq: 0,
             websocket_url: None,
             pending_commands: Vec::new(),
@@ -783,6 +812,7 @@ impl App {
 
         while self.running {
             self.drain_bg_results();
+            self.maybe_poll_github_prs();
 
             terminal.draw(|frame| ui::draw(frame, self))?;
 
@@ -794,6 +824,10 @@ impl App {
                 if was_idle && self.pending_ws_sync {
                     self.pending_ws_sync = false;
                     self.spawn_incremental_sync();
+                }
+                if was_idle && self.pending_pr_poll {
+                    self.pending_pr_poll = false;
+                    self.spawn_github_prs_fetch();
                 }
 
                 if self.error.is_some() {
@@ -1435,6 +1469,31 @@ impl App {
         }
 
         items
+    }
+
+    /// Fire a PR fetch if it's time (interval elapsed since last fetch, gh
+    /// available, not already loading). If the user is idle, defer until
+    /// they're back — mirrors the pattern used for the Todoist WebSocket
+    /// sync. Called once per main-loop tick; the cost is a timestamp compare.
+    fn maybe_poll_github_prs(&mut self) {
+        if !self.gh_available || self.github_prs_loading {
+            return;
+        }
+        let elapsed_secs = self
+            .github_prs_fetched_at
+            .map(|at| (Local::now() - at).num_seconds())
+            .unwrap_or(i64::MAX);
+        if elapsed_secs < self.github_prs_poll_interval_secs as i64 {
+            return;
+        }
+        if self.is_idle() {
+            // Hold off while idle; fire on the next keystroke so the user
+            // always sees fresh data on return but we don't burn requests
+            // while they're AFK.
+            self.pending_pr_poll = true;
+            return;
+        }
+        self.spawn_github_prs_fetch();
     }
 
     pub fn refresh_all_sources(&mut self) {

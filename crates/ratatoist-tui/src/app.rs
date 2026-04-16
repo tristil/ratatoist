@@ -2984,17 +2984,39 @@ fn collect_project_subtree(parent_id: Option<&str>, all: &[Project], out: &mut V
     }
 }
 
-/// Shell out to `gh search prs --author @me --state open --json ...` and parse
-/// the JSON array into `PullRequest` records. Errors surface either as the
-/// non-zero-exit stderr from `gh` or a JSON parse failure.
+/// Run two `gh search prs` queries in parallel — one for PRs I authored, one
+/// for PRs assigned to me — merge the results, dedup by URL. GitHub search's
+/// flag-based qualifiers are ANDed, so capturing both relationships needs
+/// two calls. Errors from either query are surfaced; partial success (one
+/// query fails, one succeeds) is treated as a failure so the user sees the
+/// problem rather than a silently truncated list.
 async fn fetch_github_prs() -> Result<Vec<PullRequest>> {
+    let (authored, assigned) = tokio::try_join!(
+        fetch_github_prs_with_flag("--author"),
+        fetch_github_prs_with_flag("--assignee"),
+    )?;
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged: Vec<PullRequest> = Vec::with_capacity(authored.len() + assigned.len());
+    for pr in authored.into_iter().chain(assigned.into_iter()) {
+        if seen.insert(pr.url.clone()) {
+            merged.push(pr);
+        }
+    }
+    Ok(merged)
+}
+
+/// Shell out to `gh search prs <flag> @me --state open --json ...` and parse
+/// the JSON array into `PullRequest` records. `flag` is `--author` or
+/// `--assignee`; the rest of the query is identical.
+async fn fetch_github_prs_with_flag(flag: &str) -> Result<Vec<PullRequest>> {
     use tokio::process::Command;
 
     let output = Command::new("gh")
         .args([
             "search",
             "prs",
-            "--author",
+            flag,
             "@me",
             "--state",
             "open",

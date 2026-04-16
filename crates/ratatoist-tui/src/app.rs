@@ -478,6 +478,11 @@ pub struct App {
     /// Set when we'd have polled PRs but the user is idle; fired on the next
     /// keystroke (same pattern as `pending_ws_sync`).
     pending_pr_poll: bool,
+    /// Background poll interval for `acli jira workitem search` (seconds).
+    /// Jira Cloud's per-user rate-limit budget easily accommodates a 10s
+    /// cadence for one user. Default 10s.
+    pub jira_cards_poll_interval_secs: u64,
+    pending_jira_poll: bool,
     comments_fetch_seq: u64,
     websocket_url: Option<String>,
     pending_commands: Vec<SyncCommand>,
@@ -539,6 +544,20 @@ fn load_github_prs_poll_interval_secs() -> u64 {
         return secs.max(5);
     }
     DEFAULT_GITHUB_PRS_POLL_INTERVAL_SECS
+}
+
+/// Default background poll interval for `acli jira workitem search`.
+const DEFAULT_JIRA_CARDS_POLL_INTERVAL_SECS: u64 = 10;
+
+fn load_jira_cards_poll_interval_secs() -> u64 {
+    let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
+    if let Ok(src) = std::fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&src)
+        && let Some(secs) = val["jira_cards_poll_interval_secs"].as_u64()
+    {
+        return secs.max(5);
+    }
+    DEFAULT_JIRA_CARDS_POLL_INTERVAL_SECS
 }
 
 fn load_idle_timeout_secs() -> u64 {
@@ -623,6 +642,7 @@ impl App {
             "idle_timeout_secs": self.idle_timeout_secs,
             "hidden_pr_orgs": hidden,
             "github_prs_poll_interval_secs": self.github_prs_poll_interval_secs,
+            "jira_cards_poll_interval_secs": self.jira_cards_poll_interval_secs,
         });
         let _ = std::fs::write(
             &path,
@@ -733,6 +753,8 @@ impl App {
             pending_ws_sync: false,
             github_prs_poll_interval_secs: load_github_prs_poll_interval_secs(),
             pending_pr_poll: false,
+            jira_cards_poll_interval_secs: load_jira_cards_poll_interval_secs(),
+            pending_jira_poll: false,
             comments_fetch_seq: 0,
             websocket_url: None,
             pending_commands: Vec::new(),
@@ -809,10 +831,17 @@ impl App {
         if self.gh_available && self.github_prs.is_empty() && self.github_prs_fetched_at.is_none() {
             self.spawn_github_prs_fetch();
         }
+        if self.acli_available
+            && self.jira_cards.is_empty()
+            && self.jira_cards_fetched_at.is_none()
+        {
+            self.spawn_jira_cards_fetch();
+        }
 
         while self.running {
             self.drain_bg_results();
             self.maybe_poll_github_prs();
+            self.maybe_poll_jira_cards();
 
             terminal.draw(|frame| ui::draw(frame, self))?;
 
@@ -828,6 +857,10 @@ impl App {
                 if was_idle && self.pending_pr_poll {
                     self.pending_pr_poll = false;
                     self.spawn_github_prs_fetch();
+                }
+                if was_idle && self.pending_jira_poll {
+                    self.pending_jira_poll = false;
+                    self.spawn_jira_cards_fetch();
                 }
 
                 if self.error.is_some() {
@@ -1496,6 +1529,25 @@ impl App {
         self.spawn_github_prs_fetch();
     }
 
+    /// Mirror of `maybe_poll_github_prs` for Jira cards.
+    fn maybe_poll_jira_cards(&mut self) {
+        if !self.acli_available || self.jira_cards_loading {
+            return;
+        }
+        let elapsed_secs = self
+            .jira_cards_fetched_at
+            .map(|at| (Local::now() - at).num_seconds())
+            .unwrap_or(i64::MAX);
+        if elapsed_secs < self.jira_cards_poll_interval_secs as i64 {
+            return;
+        }
+        if self.is_idle() {
+            self.pending_jira_poll = true;
+            return;
+        }
+        self.spawn_jira_cards_fetch();
+    }
+
     pub fn refresh_all_sources(&mut self) {
         self.spawn_github_prs_fetch();
         self.spawn_jira_cards_fetch();
@@ -2118,6 +2170,11 @@ impl App {
 
     pub fn project_list_entries(&self) -> Vec<ProjectEntry> {
         let mut entries = Vec::new();
+        // All is the top-level dashboard row — lives above everything else,
+        // independent of the Inbox grouping. Today / Upcoming / PR / Jira
+        // views still sit under Inbox as virtual children of the personal
+        // project group.
+        entries.push(ProjectEntry::AllView);
         let mut in_personal = false;
         let mut last_ws_id: Option<&str> = None;
         let mut last_folder_id: Option<&str> = None;
@@ -2162,7 +2219,6 @@ impl App {
                 let is_inbox = self.projects[i].is_inbox();
                 entries.push(ProjectEntry::Project(i));
                 if is_inbox {
-                    entries.push(ProjectEntry::AllView);
                     entries.push(ProjectEntry::TodayView);
                     entries.push(ProjectEntry::UpcomingView);
                     // One Pull Requests entry per GitHub owner that has open

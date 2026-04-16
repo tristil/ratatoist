@@ -18,6 +18,7 @@ pub enum KeyAction {
     CloseAllFolds,
     CompleteTask,
     CompleteTaskById(String),
+    OpenDetailById(String),
     #[allow(dead_code)]
     OpenPriorityPicker,
     SelectPriority,
@@ -466,12 +467,18 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
                 KeyAction::Consumed
             }
             Pane::Tasks if app.all_view_active => {
+                // All-view items are indexed into raw `self.tasks`,
+                // `self.github_prs`, and `self.jira_cards`. For tasks, route
+                // through `OpenDetailById` since `visible_tasks()` (used by
+                // the regular `OpenDetail` path) is project-scoped on the All
+                // view. For PRs, `selected_pr` becomes a raw index —
+                // `open_selected_pr_in_browser` is All-view-aware.
                 let items = app.all_view_items();
                 match items.get(app.selected_all_item) {
-                    Some(crate::app::AllViewItem::Task(i)) => {
-                        app.selected_task = *i;
-                        KeyAction::OpenDetail
-                    }
+                    Some(crate::app::AllViewItem::Task(i)) => match app.tasks.get(*i) {
+                        Some(task) => KeyAction::OpenDetailById(task.id.clone()),
+                        None => KeyAction::Consumed,
+                    },
                     Some(crate::app::AllViewItem::PullRequest(i)) => {
                         app.selected_pr = *i;
                         KeyAction::OpenSelectedPrInBrowser
@@ -592,12 +599,18 @@ fn handle_standard(app: &mut App, key: KeyEvent) -> KeyAction {
                 KeyAction::Consumed
             }
             Pane::Tasks if app.all_view_active => {
+                // All-view items are indexed into raw `self.tasks`,
+                // `self.github_prs`, and `self.jira_cards`. For tasks, route
+                // through `OpenDetailById` since `visible_tasks()` (used by
+                // the regular `OpenDetail` path) is project-scoped on the All
+                // view. For PRs, `selected_pr` becomes a raw index —
+                // `open_selected_pr_in_browser` is All-view-aware.
                 let items = app.all_view_items();
                 match items.get(app.selected_all_item) {
-                    Some(crate::app::AllViewItem::Task(i)) => {
-                        app.selected_task = *i;
-                        KeyAction::OpenDetail
-                    }
+                    Some(crate::app::AllViewItem::Task(i)) => match app.tasks.get(*i) {
+                        Some(task) => KeyAction::OpenDetailById(task.id.clone()),
+                        None => KeyAction::Consumed,
+                    },
                     Some(crate::app::AllViewItem::PullRequest(i)) => {
                         app.selected_pr = *i;
                         KeyAction::OpenSelectedPrInBrowser

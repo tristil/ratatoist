@@ -2729,6 +2729,9 @@ impl App {
                 if t.is_deleted || t.parent_id.is_some() {
                     return false;
                 }
+                if self.pending_close_recurring.contains(&t.id) {
+                    return false;
+                }
                 if let Some(dock) = self.dock_filter {
                     return match dock {
                         DockItem::DueOverdue => {
@@ -3444,6 +3447,50 @@ mod tests {
             "recurring task must stay unchecked after optimistic complete"
         );
         assert_eq!(pending_cmd_types(&app), vec!["item_close".to_string()]);
+    }
+
+    /// Regression: completing a recurring task in the project view must hide
+    /// it immediately via `pending_close_recurring`, not leave it visible.
+    #[test]
+    fn completing_recurring_in_project_view_hides_immediately() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.tasks.push(Task {
+            id: "rec".to_string(),
+            content: "Clean air purifier prefilters".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: "2026-07-16".to_string(),
+                is_recurring: true,
+                string: Some("every month".to_string()),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.tasks.push(Task {
+            id: "other".to_string(),
+            content: "Other task".to_string(),
+            project_id: "p1".to_string(),
+            ..Task::default()
+        });
+        app.selected_project = 0; // "p1" is at index 0
+        app.active_pane = Pane::Tasks;
+        app.selected_task = 0;
+
+        app.enqueue_complete_selected();
+
+        let visible_ids: Vec<&str> =
+            app.visible_tasks().iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            !visible_ids.contains(&"rec"),
+            "recurring task must disappear from project view after completing"
+        );
+        assert!(app.pending_close_recurring.contains("rec"));
+        assert!(!app.tasks.iter().find(|t| t.id == "rec").unwrap().checked);
     }
 
     /// Regression: pressing `x` on a Todoist task in the All view must

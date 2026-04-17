@@ -3198,7 +3198,10 @@ mod tests {
 
     fn test_app() -> App {
         let client = TodoistClient::new("test_token").expect("client");
-        App::new(client, false, true)
+        let mut app = App::new(client, false, true);
+        // Isolate tests from on-disk config (e.g. hidden_pr_orgs in ui_settings.json).
+        app.hidden_pr_orgs.clear();
+        app
     }
 
     /// Dispatch a key event through the same routing the main loop uses.

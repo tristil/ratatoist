@@ -74,10 +74,19 @@ must include a spec update in the same PR:
 
 If unsure which spec to update, grep `specifications/` for keywords from the change.
 
-**Order of operations:** spec first, then code. The `/spec-first <description>` slash
-command (`.claude/commands/spec-first.md`) enforces this — use it for any change that
-touches behavior, display, or actions. Bug fixes that don't change behavior can skip
-the spec step; see the command's escape hatch.
+**Order of operations:** spec first, then code. A PreToolUse hook
+(`scripts/spec-first-check.sh`, wired in `.claude/settings.json`) blocks Edit/Write
+on `crates/**/src/**` unless `specifications/` has an uncommitted change or a commit
+on the current branch vs. `develop`. The `/spec-first <description>` slash command
+(`.claude/commands/spec-first.md`) runs the full workflow explicitly.
+
+**Pure bug fix with no behavior change?** Bypass the hook by creating the override file:
+```
+touch .claude/spec-override
+```
+Remove it after the change is committed. Use this sparingly — if you're fixing code to
+match the existing spec (not changing behavior) it's legitimate; otherwise update the
+spec.
 
 ## Edition & syntax
 

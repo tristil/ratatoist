@@ -36,3 +36,11 @@ The spec edit and code edit go in the same commit (or at minimum the same PR). N
 ## Escape hatch
 
 If this is a pure bug fix with **no** behavior, display, or action change — i.e. the current spec is already correct and the code is just being made to match it — say so explicitly in step 1 and skip to step 3. Err on the side of updating the spec when in doubt.
+
+The repo has a PreToolUse hook (`scripts/spec-first-check.sh`) that blocks edits under `crates/**/src/**` when no spec changes exist on this branch. To bypass it for a pure bug fix, create the override file before editing:
+
+```
+touch .claude/spec-override
+```
+
+Remove `.claude/spec-override` after the change is committed.

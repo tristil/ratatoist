@@ -353,6 +353,44 @@ fn binary_available(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Check whether `gws` is configured to read the user's Google Calendar.
+/// Runs `gws auth status` (JSON by default) and verifies the granted scope
+/// list includes the calendar scope. Returns false if the binary is absent,
+/// the user hasn't run `gws auth login`, or calendar access wasn't granted —
+/// any of which would make the Agenda view a dead end. Runs once at startup.
+fn gws_calendar_configured() -> bool {
+    let Ok(output) = std::process::Command::new("gws")
+        .args(["auth", "status"])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    // `gws auth status` emits one line of log chatter to stdout before the
+    // JSON document; find the first `{` and parse from there.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(json_start) = stdout.find('{') else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout[json_start..]) else {
+        return false;
+    };
+    val.get("scopes")
+        .and_then(|s| s.as_array())
+        .map(|scopes| {
+            scopes.iter().filter_map(|s| s.as_str()).any(|s| {
+                s == "https://www.googleapis.com/auth/calendar"
+                    || s == "https://www.googleapis.com/auth/calendar.readonly"
+                    || s == "https://www.googleapis.com/auth/calendar.events"
+                    || s == "https://www.googleapis.com/auth/calendar.events.readonly"
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// A pull request row as returned by `gh search prs --json ...`. Subset of the
 /// gh schema — only what we render. `node_id` and `check_status` are
 /// populated by a follow-up GraphQL call after the search; `check_status`
@@ -511,6 +549,11 @@ pub struct App {
     pub agenda_error: Option<String>,
     pub agenda_fetched_at: Option<chrono::DateTime<Local>>,
     pub selected_agenda_item: usize,
+    /// True if `gws` is on PATH AND `gws auth status` reports a granted
+    /// scope that lets us read the user's calendar. Gates the Agenda sidebar
+    /// entry and all agenda fetches — when false, the entry stays hidden so
+    /// users who installed `gws` without authorizing calendar access don't
+    /// see a view that can't load. Probed once at startup.
     pub gws_available: bool,
     pub all_view_active: bool,
     pub selected_all_item: usize,
@@ -827,7 +870,7 @@ impl App {
             agenda_error: None,
             agenda_fetched_at: None,
             selected_agenda_item: 0,
-            gws_available: binary_available("gws"),
+            gws_available: gws_calendar_configured(),
             // Start on the All view — it's the primary landing page (first
             // sidebar entry) and surfaces Today's tasks, open PRs, and Jira
             // cards in one place.

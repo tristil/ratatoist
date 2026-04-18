@@ -17,7 +17,7 @@ A terminal UI client for Todoist. Lets users manage their tasks without leaving 
 - Dual input modes: Vim (`j`/`k`/`h`/`l`, Normal/Insert/Visual) and Standard (arrow keys).
 - Task list with foldable subtask trees.
 - Detail pane with scrollable content, comments, and inline field editing.
-- StatsDock showing overdue / today / week / P1–P4 counts; click to filter.
+- StatsDock showing overdue / today / week / P1–P4 counts; click to filter. **Hidden by default** — set `"show_stats": true` in `~/.config/ratatoist/ui_settings.json` to bring it back. When hidden the sidebar skips both the block and its focus slot, so Tab / Shift-Tab and the end-of-sidebar `j` wrap never land on a pane that isn't on screen.
 
 ## Task Management
 

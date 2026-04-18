@@ -4,6 +4,31 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{App, DOCK_ITEMS, InputMode, Pane, ProjectNavItem, VimState};
 
+/// Move focus forward (Tab / Right) from `Pane::Tasks` to the next
+/// visible pane. Normally this lands on StatsDock, but when the user has
+/// opted out via `show_stats=false` we wrap back to Projects instead so
+/// focus never targets a hidden pane.
+fn advance_into_stats_or_wrap(app: &mut App) {
+    if app.show_stats {
+        app.dock_focus = Some(0);
+        app.active_pane = Pane::StatsDock;
+    } else {
+        app.active_pane = Pane::Projects;
+    }
+}
+
+/// Mirror of `advance_into_stats_or_wrap` for backwards focus motion
+/// (BackTab / Left) out of `Pane::Projects`. When Stats is hidden we
+/// wrap around to Tasks.
+fn retreat_into_stats_or_wrap(app: &mut App) {
+    if app.show_stats {
+        app.dock_focus = Some(DOCK_ITEMS.len() - 1);
+        app.active_pane = Pane::StatsDock;
+    } else {
+        app.active_pane = Pane::Tasks;
+    }
+}
+
 pub enum KeyAction {
     Quit,
     ProjectChanged,
@@ -439,10 +464,7 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => {
             match app.active_pane {
                 Pane::Projects => app.active_pane = Pane::Tasks,
-                Pane::Tasks => {
-                    app.dock_focus = Some(0);
-                    app.active_pane = Pane::StatsDock;
-                }
+                Pane::Tasks => advance_into_stats_or_wrap(app),
                 _ => {}
             }
             KeyAction::Consumed
@@ -460,10 +482,7 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
         KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => {
             match app.active_pane {
                 Pane::Tasks => app.active_pane = Pane::Projects,
-                Pane::Projects => {
-                    app.dock_focus = Some(DOCK_ITEMS.len() - 1);
-                    app.active_pane = Pane::StatsDock;
-                }
+                Pane::Projects => retreat_into_stats_or_wrap(app),
                 _ => {}
             }
             KeyAction::Consumed
@@ -586,10 +605,7 @@ fn handle_standard(app: &mut App, key: KeyEvent) -> KeyAction {
         KeyCode::Right | KeyCode::Tab => {
             match app.active_pane {
                 Pane::Projects => app.active_pane = Pane::Tasks,
-                Pane::Tasks => {
-                    app.dock_focus = Some(0);
-                    app.active_pane = Pane::StatsDock;
-                }
+                Pane::Tasks => advance_into_stats_or_wrap(app),
                 _ => {}
             }
             KeyAction::Consumed
@@ -597,10 +613,7 @@ fn handle_standard(app: &mut App, key: KeyEvent) -> KeyAction {
         KeyCode::Left | KeyCode::BackTab => {
             match app.active_pane {
                 Pane::Tasks => app.active_pane = Pane::Projects,
-                Pane::Projects => {
-                    app.dock_focus = Some(DOCK_ITEMS.len() - 1);
-                    app.active_pane = Pane::StatsDock;
-                }
+                Pane::Projects => retreat_into_stats_or_wrap(app),
                 _ => {}
             }
             KeyAction::Consumed
@@ -704,8 +717,13 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                 .unwrap_or(0) as i32;
             let next_pos = pos + delta;
             if next_pos >= nav.len() as i32 {
-                app.dock_focus = Some(0);
-                app.active_pane = Pane::StatsDock;
+                // Past the last sidebar entry: descend into StatsDock if
+                // the user has it enabled, otherwise stay put — nothing
+                // below on screen to focus.
+                if app.show_stats {
+                    app.dock_focus = Some(0);
+                    app.active_pane = Pane::StatsDock;
+                }
                 return KeyAction::Consumed;
             }
             if next_pos < 0 {

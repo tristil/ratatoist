@@ -14,8 +14,11 @@ A passive counter in the left sidebar that earns a star every time the user comp
 
 - Rendered as a dedicated block at the bottom of the left sidebar, below the Stats block. Uses the same rounded-border block styling as Stats.
 - Title: ` Star jar `.
-- Content: a single line `★ <count> today` when count > 0; when count is zero, `—` rendered in the muted style so the block isn't distracting at the start of a day.
+- Content: one ★ glyph per earned star (styled yellow), packed across the block's inner width with a single space between glyphs. Rows fill left-to-right, top-to-bottom — the block height equals `ceil(count / stars_per_row).max(1)` body lines plus two borders, so the jar **grows upward** into the project list as the day's count climbs. When count is zero, the body is a single muted `—` row so the block doesn't disappear at the start of a day.
+- No numeric count rendered — users read the jar visually. Individual stars are the point.
 - No selection, no highlight, no keybinding. The block is purely informational.
+- **Overflow collapse — 5 yellow stars → 1 purple star.** When the jar would otherwise grow taller than the available budget in the sidebar (computed as `left_area.height − stats − borders − a small floor reserved for the project list`), the rendering switches to a *collapsed* representation: every five completions are drawn as one purple ★, with any remainder (count mod 5) shown as trailing yellow stars. The switch is all-or-nothing — once collapse is active, every star in the jar renders as purple-or-yellow, not a mix where some groups of five are collapsed and others aren't.
+- If collapse itself runs out of room (enough purple stars to overflow the budget), the block simply clips at its allotted height. The plan for this case is: figure it out when we hit it. A second collapse tier (e.g. 25 yellows → 1 gold star) is an obvious next step.
 
 ## Actions
 

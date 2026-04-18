@@ -451,6 +451,10 @@ pub struct CalendarEvent {
     /// `htmlLink` from the event — opens the event in Google Calendar web.
     /// Used by Enter-to-open-in-browser on agenda rows.
     pub html_link: String,
+    /// Display name of the calendar this event came from (the
+    /// `calendarList` entry's `summaryOverride` or `summary`). Surfaced in
+    /// the agenda row when multiple calendars contribute to today's list.
+    pub calendar_name: String,
 }
 
 enum BgResult {
@@ -3502,17 +3506,17 @@ async fn fetch_jira_cards() -> Result<Vec<JiraCard>> {
     Ok(cards)
 }
 
-/// Shell out to `gws calendar events list` for today's window on the
-/// primary calendar and parse the result into `CalendarEvent` records.
-/// Errors (missing gws, auth failure, network) surface as the error
-/// message. "Today" is computed in the user's local timezone.
+/// Fetch today's events blended across every subscribed, visible Google
+/// Calendar. Enumerates calendars via `gws calendar calendarList list`,
+/// filters to entries where `selected == true && hidden != true`, then
+/// fetches events from each one concurrently and merges the results sorted
+/// by start time. Returns an error only if enumeration fails or every
+/// per-calendar fetch fails; individual calendar failures are logged and
+/// dropped so one broken calendar doesn't blank the whole agenda.
+/// "Today" is computed in the user's local timezone.
 async fn fetch_agenda_events() -> Result<Vec<CalendarEvent>> {
     use chrono::{Local, TimeZone};
-    use tokio::process::Command;
 
-    // 00:00 local today → 00:00 local tomorrow, as RFC3339 strings with the
-    // local offset. Calendar events-list honors this window and expands
-    // recurring events when `singleEvents=true`.
     let now = Local::now();
     let today = now.date_naive();
     let tomorrow = today + chrono::Duration::days(1);
@@ -3527,8 +3531,118 @@ async fn fetch_agenda_events() -> Result<Vec<CalendarEvent>> {
     let time_min = start_local.to_rfc3339();
     let time_max = end_local.to_rfc3339();
 
+    let calendars = fetch_subscribed_calendars().await?;
+    if calendars.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let fetches = calendars.into_iter().map(|(id, name)| {
+        let time_min = time_min.clone();
+        let time_max = time_max.clone();
+        async move {
+            let res = fetch_events_for_calendar(&id, &name, &time_min, &time_max).await;
+            (name, res)
+        }
+    });
+    let results = futures_util::future::join_all(fetches).await;
+
+    let mut events = Vec::new();
+    let mut first_error: Option<anyhow::Error> = None;
+    let mut success_count = 0usize;
+    for (name, res) in results {
+        match res {
+            Ok(mut batch) => {
+                success_count += 1;
+                events.append(&mut batch);
+            }
+            Err(e) => {
+                tracing::warn!(calendar = %name, error = %e, "agenda fetch failed for calendar");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+
+    if success_count == 0
+        && let Some(e) = first_error
+    {
+        return Err(e);
+    }
+
+    events.sort_by(|a, b| a.start.cmp(&b.start));
+    Ok(events)
+}
+
+/// Enumerate the user's subscribed, visible calendars. Returns pairs of
+/// `(calendar id, display name)` — the id is used for the events-list
+/// request, the name is surfaced in the agenda row so blended events can
+/// be attributed back to their source calendar.
+async fn fetch_subscribed_calendars() -> Result<Vec<(String, String)>> {
+    use tokio::process::Command;
+
+    let output = Command::new("gws")
+        .args(["calendar", "calendarList", "list"])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to invoke gws: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if stderr.is_empty() {
+            format!("gws calendarList exited with status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(anyhow::anyhow!("{msg}"));
+    }
+
+    let raw: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("gws calendarList JSON parse error: {e}"))?;
+    let empty = vec![];
+    let items = raw
+        .get("items")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+
+    let mut calendars = Vec::with_capacity(items.len());
+    for item in items {
+        // Google omits both flags when they're false, so treat absent as
+        // the default: not-selected and not-hidden.
+        let selected = item.get("selected").and_then(|v| v.as_bool()) == Some(true);
+        let hidden = item.get("hidden").and_then(|v| v.as_bool()) == Some(true);
+        if !selected || hidden {
+            continue;
+        }
+        let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // `summaryOverride` is the user's local rename in Calendar web;
+        // prefer it over the calendar owner's `summary`.
+        let name = item
+            .get("summaryOverride")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.get("summary").and_then(|v| v.as_str()))
+            .unwrap_or(id)
+            .to_string();
+        calendars.push((id.to_string(), name));
+    }
+    Ok(calendars)
+}
+
+/// Fetch today's events for a single calendar. `calendar_name` is stamped
+/// onto each returned `CalendarEvent` so merged results retain their
+/// origin.
+async fn fetch_events_for_calendar(
+    calendar_id: &str,
+    calendar_name: &str,
+    time_min: &str,
+    time_max: &str,
+) -> Result<Vec<CalendarEvent>> {
+    use tokio::process::Command;
+
     let params = serde_json::json!({
-        "calendarId": "primary",
+        "calendarId": calendar_id,
         "timeMin": time_min,
         "timeMax": time_max,
         "singleEvents": true,
@@ -3553,12 +3667,8 @@ async fn fetch_agenda_events() -> Result<Vec<CalendarEvent>> {
         return Err(anyhow::anyhow!("{msg}"));
     }
 
-    // Response shape: `{ "items": [ {...event...}, ... ] }`.
-    // `start` is either `{"dateTime": "..."}` (timed) or `{"date": "..."}`
-    // (all-day). Same for `end`.
     let raw: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| anyhow::anyhow!("gws JSON parse error: {e}"))?;
-
     let empty = vec![];
     let items = raw
         .get("items")
@@ -3572,10 +3682,8 @@ async fn fetch_agenda_events() -> Result<Vec<CalendarEvent>> {
         if item.get("status").and_then(|s| s.as_str()) == Some("cancelled") {
             continue;
         }
-        let start_obj = item.get("start");
-        let end_obj = item.get("end");
-        let (start, all_day) = extract_time(start_obj);
-        let (end, _) = extract_time(end_obj);
+        let (start, all_day) = extract_time(item.get("start"));
+        let (end, _) = extract_time(item.get("end"));
         events.push(CalendarEvent {
             summary: item
                 .get("summary")
@@ -3595,6 +3703,7 @@ async fn fetch_agenda_events() -> Result<Vec<CalendarEvent>> {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string(),
+            calendar_name: calendar_name.to_string(),
         });
     }
     Ok(events)
@@ -4321,6 +4430,7 @@ mod tests {
             all_day: false,
             location: String::new(),
             html_link: "https://calendar.google.com/event?eid=abc".to_string(),
+            calendar_name: "Work".to_string(),
         });
         app.agenda_events.push(CalendarEvent {
             summary: "Dentist".to_string(),
@@ -4329,6 +4439,7 @@ mod tests {
             all_day: false,
             location: "Main St.".to_string(),
             html_link: "https://calendar.google.com/event?eid=def".to_string(),
+            calendar_name: "Personal".to_string(),
         });
 
         let items = app.all_view_items();

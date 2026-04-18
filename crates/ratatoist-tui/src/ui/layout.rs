@@ -7,9 +7,79 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use crate::app::{App, DOCK_ITEMS, DockItem, Pane, SortMode, TaskFilter};
 
 const STATS_HEIGHT: u16 = 4;
-/// Bordered block at the bottom of the left column: 1 top border + 1 body
-/// line + 1 bottom border. See [`star-jar.spec.md`](../../../specifications/star-jar.spec.md).
-const STAR_JAR_HEIGHT: u16 = 3;
+/// Each rendered star takes one glyph + one separator space. Used to
+/// compute how many stars fit on a sidebar row before wrapping.
+const STAR_CELL_WIDTH: u16 = 2;
+/// Inner horizontal padding the star-jar block subtracts from its own
+/// width (left border + left pad + right pad + right border).
+const STAR_JAR_H_PADDING: u16 = 4;
+/// Borders (top + bottom) added on top of the variable body height.
+const STAR_JAR_BORDER_ROWS: u16 = 2;
+/// Minimum rows the project list is allowed to keep when the star jar
+/// grows. Defines the point at which we start collapsing five yellow
+/// stars into one purple star to buy more vertical space.
+const STAR_JAR_PROJECT_FLOOR: u16 = 3;
+/// Ratio used when collapse is active: five completions → one purple star.
+const STAR_COLLAPSE_GROUP: u64 = 5;
+
+/// Kind of star rendered in the jar. Regular yellow for a single
+/// completion, purple for a collapsed group of five.
+#[derive(Copy, Clone)]
+enum StarKind {
+    Yellow,
+    Purple,
+}
+
+/// Pre-computed rendering of the star jar for the current frame. Built
+/// once in [`render`] so the block's `Constraint::Length` and the body
+/// contents agree on height. See
+/// [`star-jar.spec.md`](../../../specifications/star-jar.spec.md).
+struct StarJarPlan {
+    /// Rows the body (excluding borders) will occupy.
+    body_rows: u16,
+    /// One row per `Vec`, each holding the glyphs for that row in
+    /// left-to-right order. Empty outer vec ↔ count was zero.
+    rows: Vec<Vec<StarKind>>,
+}
+
+/// Plan the star-jar rendering for `count` completions given the sidebar
+/// width and the vertical budget the block may occupy. When the naive
+/// all-yellow rendering would exceed the budget, switch to collapsed
+/// mode (5 yellow → 1 purple). If collapse still overflows, the extra
+/// rows are kept in the plan and the caller will clip them — see the
+/// spec for the "figure it out when we hit it" overflow note.
+fn plan_star_jar(sidebar_width: u16, max_body_rows: u16, count: u64) -> StarJarPlan {
+    if count == 0 {
+        return StarJarPlan {
+            body_rows: 1,
+            rows: vec![Vec::new()],
+        };
+    }
+
+    let inner_w = sidebar_width.saturating_sub(STAR_JAR_H_PADDING);
+    let per_row = (inner_w / STAR_CELL_WIDTH).max(1) as u64;
+    let naive_rows = count.div_ceil(per_row);
+    let max = max_body_rows.max(1) as u64;
+
+    let kinds: Vec<StarKind> = if naive_rows <= max {
+        std::iter::repeat_n(StarKind::Yellow, count as usize).collect()
+    } else {
+        let purples = count / STAR_COLLAPSE_GROUP;
+        let yellows = count % STAR_COLLAPSE_GROUP;
+        let mut v: Vec<StarKind> =
+            std::iter::repeat_n(StarKind::Purple, purples as usize).collect();
+        v.extend(std::iter::repeat_n(StarKind::Yellow, yellows as usize));
+        v
+    };
+
+    let per_row_usize = per_row as usize;
+    let rows: Vec<Vec<StarKind>> = kinds
+        .chunks(per_row_usize)
+        .map(|c| c.to_vec())
+        .collect();
+    let body_rows = (rows.len() as u16).max(1);
+    StarJarPlan { body_rows, rows }
+}
 use crate::ui::theme::Theme;
 
 use super::keyhints;
@@ -35,30 +105,44 @@ pub fn render(frame: &mut Frame, app: &App) {
     let stats_active = matches!(app.active_pane, Pane::StatsDock);
     let settings_active = matches!(app.active_pane, Pane::Settings);
 
+    // Budget the jar may occupy before collapsing. Reserve Stats, the
+    // jar's own borders, optional settings block, and a floor of project
+    // rows; whatever's left becomes the max body height for the jar.
+    let settings_rows: u16 = if app.show_settings { 5 } else { 0 };
+    let max_body = left_area
+        .height
+        .saturating_sub(STATS_HEIGHT)
+        .saturating_sub(STAR_JAR_BORDER_ROWS)
+        .saturating_sub(settings_rows)
+        .saturating_sub(STAR_JAR_PROJECT_FLOOR)
+        .max(1);
+    let plan = plan_star_jar(left_area.width, max_body, app.star_count);
+    let jar_height = plan.body_rows.saturating_add(STAR_JAR_BORDER_ROWS);
+
     if app.show_settings {
         let [projects_area, stats_area, star_area, settings_area] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(STATS_HEIGHT),
-            Constraint::Length(STAR_JAR_HEIGHT),
-            Constraint::Length(5),
+            Constraint::Length(jar_height),
+            Constraint::Length(settings_rows),
         ])
         .areas(left_area);
 
         render_projects_block(frame, app, projects_area, projects_active);
         render_stats_block(frame, app, stats_area, stats_active);
-        render_star_jar_block(frame, app, star_area);
+        render_star_jar_block(frame, app, star_area, &plan);
         views::settings::render(frame, app, settings_area, settings_active);
     } else {
         let [projects_area, stats_area, star_area] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(STATS_HEIGHT),
-            Constraint::Length(STAR_JAR_HEIGHT),
+            Constraint::Length(jar_height),
         ])
         .areas(left_area);
 
         render_projects_block(frame, app, projects_area, projects_active);
         render_stats_block(frame, app, stats_area, stats_active);
-        render_star_jar_block(frame, app, star_area);
+        render_star_jar_block(frame, app, star_area, &plan);
     }
 
     if matches!(app.active_pane, Pane::Detail) {
@@ -269,11 +353,11 @@ fn render_filter_row(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Passive counter block at the bottom of the left sidebar. One star per
-/// task completion, resets at local midnight. No focus, no keybinding —
-/// never takes an `active` flag. See
+/// Passive counter block at the bottom of the left sidebar. One yellow
+/// ★ per task completion, collapsing to purple ★ (×5) when rows run out.
+/// No focus, no keybinding. See
 /// [`star-jar.spec.md`](../../../specifications/star-jar.spec.md).
-fn render_star_jar_block(frame: &mut Frame, app: &App, area: Rect) {
+fn render_star_jar_block(frame: &mut Frame, app: &App, area: Rect, plan: &StarJarPlan) {
     let theme = app.theme();
     let block = Block::default()
         .title(" Star jar ")
@@ -286,16 +370,30 @@ fn render_star_jar_block(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let line = if app.star_count == 0 {
-        Line::from(Span::styled("—", theme.muted_text()))
+    let yellow = Style::default().fg(Color::Yellow);
+    let purple = Style::default().fg(Color::Magenta);
+    let lines: Vec<Line> = if app.star_count == 0 {
+        vec![Line::from(Span::styled("—", theme.muted_text()))]
     } else {
-        Line::from(vec![
-            Span::styled("★ ", Style::default().fg(Color::Yellow)),
-            Span::styled(app.star_count.to_string(), theme.normal_text()),
-            Span::styled(" today", theme.muted_text()),
-        ])
+        plan.rows
+            .iter()
+            .map(|row| {
+                let mut spans: Vec<Span> = Vec::with_capacity(row.len() * 2);
+                for (i, kind) in row.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw(" "));
+                    }
+                    let style = match kind {
+                        StarKind::Yellow => yellow,
+                        StarKind::Purple => purple,
+                    };
+                    spans.push(Span::styled("★", style));
+                }
+                Line::from(spans)
+            })
+            .collect()
     };
-    frame.render_widget(Paragraph::new(line), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_stats_block(frame: &mut Frame, app: &App, area: Rect, active: bool) {
@@ -386,4 +484,54 @@ fn render_stats_block(frame: &mut Frame, app: &App, area: Rect, active: bool) {
 
     frame.render_widget(Paragraph::new(due_line), due_area);
     frame.render_widget(Paragraph::new(prio_line), prio_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn count_kind(rows: &[Vec<StarKind>], kind: fn(&StarKind) -> bool) -> usize {
+        rows.iter().flatten().filter(|k| kind(k)).count()
+    }
+
+    #[test]
+    fn star_jar_plan_wraps_individual_stars_within_budget() {
+        // 30-wide sidebar → inner 26 → per_row = 13 stars. With max_body
+        // = 5 the budget is 5 * 13 = 65 yellow stars before collapse.
+        let plan = plan_star_jar(30, 5, 7);
+        assert_eq!(plan.body_rows, 1, "7 stars fit on one row");
+        assert_eq!(plan.rows.len(), 1);
+        assert_eq!(plan.rows[0].len(), 7);
+        assert!(matches!(plan.rows[0][0], StarKind::Yellow));
+
+        let plan = plan_star_jar(30, 5, 15);
+        assert_eq!(plan.body_rows, 2, "15 stars wrap to second row");
+        assert_eq!(plan.rows[0].len(), 13);
+        assert_eq!(plan.rows[1].len(), 2);
+    }
+
+    #[test]
+    fn star_jar_plan_collapses_to_purple_when_yellows_overflow() {
+        // Budget of 1 row * 13 per_row = 13 yellows max. 27 yellows would
+        // need 3 rows — overflow — so collapse to 5 purple + 2 yellow = 7
+        // glyphs, fits in one row.
+        let plan = plan_star_jar(30, 1, 27);
+        assert_eq!(plan.body_rows, 1);
+        assert_eq!(
+            count_kind(&plan.rows, |k| matches!(k, StarKind::Purple)),
+            5
+        );
+        assert_eq!(
+            count_kind(&plan.rows, |k| matches!(k, StarKind::Yellow)),
+            2
+        );
+    }
+
+    #[test]
+    fn star_jar_plan_empty_count_keeps_single_body_row() {
+        let plan = plan_star_jar(30, 3, 0);
+        assert_eq!(plan.body_rows, 1);
+        assert_eq!(plan.rows.len(), 1);
+        assert!(plan.rows[0].is_empty());
+    }
 }

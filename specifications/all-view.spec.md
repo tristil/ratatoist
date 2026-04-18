@@ -1,26 +1,28 @@
 # All View
 
-A combined dashboard sidebar entry that merges Today tasks, non-hidden GitHub PRs, and Jira cards into a single scrollable list with contextual actions.
+A combined dashboard sidebar entry that merges today's calendar events, Today tasks, non-hidden GitHub PRs, and Jira cards into a single scrollable list with contextual actions.
 
 ## Behavior
 
 - Appears at the **top of the sidebar** — above the personal header and Inbox — with a count badge totalling all items.
-- Sections render in order: **Today** tasks, **Pull Requests** (non-hidden orgs), **Jira Cards**, each under a bold header row (`▸ Today`, `▸ Pull Requests`, `▸ Jira Cards`). Empty sections are omitted.
+- **Selected by default at startup** so the TUI lands on the dashboard view rather than on the first project.
+- Sections render in order: **Agenda** (today's calendar events, most time-sensitive), **Today** tasks, **Pull Requests** (non-hidden orgs), **Jira Cards**, each under a bold header row (`▸ Agenda`, `▸ Today`, `▸ Pull Requests`, `▸ Jira Cards`). Empty sections are omitted.
 - `j` / `k` navigate across sections seamlessly. Section headers and spacers are skipped by the cursor.
 
 ## Contextual Actions
 
 The action triggered by a key depends on the type of the currently selected item:
 
-| Key | Task | Pull Request | Jira Card |
-|-----|------|-------------|-----------|
-| `Enter` | Open detail pane | Open PR in browser | Open card in browser |
-| `x` | Complete task | No-op | No-op |
-| `r` | Refresh PRs + Jira | Refresh PRs + Jira | Refresh PRs + Jira |
+| Key | Agenda Event | Task | Pull Request | Jira Card |
+|-----|--------------|------|-------------|-----------|
+| `Enter` | Open event in browser | Open detail pane | Open PR in browser | Open card in browser |
+| `x` | No-op | Complete task | No-op | No-op |
+| `r` | Refresh all sources | Refresh all sources | Refresh all sources | Refresh all sources |
 
 ## Data Sources
 
-- **Tasks:** Same Today filter (due today or overdue, not deleted/checked/subtask, assigned to me or unassigned, excluding pending-close-recurring).
+- **Agenda Events:** All entries from `agenda_events` — today's events from the user's primary Google Calendar (see `agenda-view.spec.md` for the fetch details). Indices reference the global vec.
+- **Tasks:** Same Today filter (due today or overdue, not deleted/checked/subtask, assigned to me or unassigned, excluding pending-close-recurring). **Tasks labeled `evening` are hidden until 17:00 local time** so they don't clutter daytime planning; they reappear after 5 PM.
 - **PRs:** All entries from `github_prs` whose owner is not in `hidden_pr_orgs`. Indices reference the global `github_prs` vec.
 - **Jira Cards:** All entries from `jira_cards`. Indices reference the global vec.
 
@@ -28,5 +30,5 @@ The action triggered by a key depends on the type of the currently selected item
 
 - Collapsible sections within the All view.
 - Drag reordering of sections.
-- Configuring which sources appear.
+- Configuring which sources appear (beyond the CLI-presence gating that hides entire sections when `gh`, `acli`, or `gws` is missing).
 - Inline PR merge, Jira transitions, or other write operations beyond task completion.

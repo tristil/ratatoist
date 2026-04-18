@@ -11,7 +11,8 @@ A terminal UI client for Todoist. Lets users manage their tasks without leaving 
 ## Navigation
 
 - Sidebar shows workspaces, folders, and projects hierarchically; favorites pinned at top.
-- Virtual views appear below Inbox: Today (overdue + due today), Upcoming (all scheduled tasks, grouped by day), one Pull Requests entry per GitHub owner that has open PRs (via `gh`; hidden when gh is absent or the owner has no open PRs), and Jira Cards (open cards assigned to the user, via `acli`; hidden when acli is absent).
+- **All** — a combined dashboard at the top of the sidebar (above the personal header and Inbox), **selected by default at startup**. Merges today's calendar events, Today tasks, open PRs, and Jira cards into one scrollable list.
+- Virtual views appear below Inbox: Today (overdue + due today), Upcoming (all scheduled tasks, grouped by day), one Pull Requests entry per GitHub owner that has open PRs authored-by or assigned-to you (via `gh`; hidden when gh is absent or there are no matching PRs), Jira Cards (open cards assigned to the user, via `acli`; hidden when acli is absent), and Agenda (today's events from the user's primary Google Calendar, via `gws`; hidden when gws is absent).
 - Dual input modes: Vim (`j`/`k`/`h`/`l`, Normal/Insert/Visual) and Standard (arrow keys).
 - Task list with foldable subtask trees.
 - Detail pane with scrollable content, comments, and inline field editing.

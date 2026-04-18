@@ -1,3 +1,4 @@
+pub mod agenda;
 pub mod all;
 pub mod detail;
 pub mod github_prs;

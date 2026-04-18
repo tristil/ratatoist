@@ -162,6 +162,11 @@ fn render_tasks_block(frame: &mut Frame, app: &App, area: Rect, active: bool) {
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
         render_external_hint_row(frame, app, hint_area, app.jira_cards_fetched_at, app.jira_cards_loading);
         views::jira_cards::render(frame, app, cards_area, active);
+    } else if app.agenda_view_active {
+        let [hint_area, events_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+        render_external_hint_row(frame, app, hint_area, app.agenda_fetched_at, app.agenda_loading);
+        views::agenda::render(frame, app, events_area, active);
     } else if app.dock_filter.is_some() {
         let [filter_area, banner_area, tasks_area] = Layout::vertical([
             Constraint::Length(1),

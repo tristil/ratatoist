@@ -309,6 +309,7 @@ pub enum ProjectEntry {
     Project(usize),
     Separator,
     AllView,
+    AgendaView,
     TodayView,
     UpcomingView,
     /// One entry per GitHub owner (user or org) that has at least one open PR.
@@ -321,6 +322,7 @@ pub enum ProjectNavItem {
     Folder(usize),
     Project(usize),
     AllView,
+    AgendaView,
     TodayView,
     UpcomingView,
     GithubPrsView(String),
@@ -329,12 +331,14 @@ pub enum ProjectNavItem {
 
 /// A tagged item in the All view. The usize is an index into the source
 /// collection (visible_tasks() for tasks, github_prs for PRs, jira_cards
-/// for Jira cards) at the time the vec was built.
+/// for Jira cards, agenda_events for calendar events) at the time the vec
+/// was built.
 #[derive(Debug, Clone, Copy)]
 pub enum AllViewItem {
     Task(usize),
     PullRequest(usize),
     JiraCard(usize),
+    AgendaEvent(usize),
 }
 
 /// Check whether a CLI tool is on PATH and responds to `--version`. Runs once
@@ -390,6 +394,26 @@ pub struct JiraCard {
     pub project_key: String,
 }
 
+/// A Google Calendar event as returned by
+/// `gws calendar events list`. Subset of the Calendar API event resource —
+/// only fields the agenda view renders.
+#[derive(Debug, Clone, Default)]
+pub struct CalendarEvent {
+    pub summary: String,
+    /// RFC 3339 start timestamp for timed events, or `YYYY-MM-DD` for
+    /// all-day events. Sort key for the agenda list.
+    pub start: String,
+    /// Same shape as `start`. Empty for events the API didn't return an end
+    /// for (rare; defensive default).
+    pub end: String,
+    /// True when the event has a `start.date` (all-day) rather than a
+    /// `start.dateTime`. Controls how we render the time column.
+    pub all_day: bool,
+    pub location: String,
+    /// `htmlLink` from the event — opens the event in Google Calendar web.
+    /// Used by Enter-to-open-in-browser on agenda rows.
+    pub html_link: String,
+}
 
 enum BgResult {
     SyncDelta(Box<SyncResponse>),
@@ -403,6 +427,7 @@ enum BgResult {
     WebSocketDisconnected,
     GithubPrsFetched(Result<Vec<PullRequest>>),
     JiraCardsFetched(Result<Vec<JiraCard>>),
+    AgendaFetched(Result<Vec<CalendarEvent>>),
     Comments {
         task_id: String,
         comments: Result<Vec<Comment>>,
@@ -480,6 +505,13 @@ pub struct App {
     pub jira_cards_fetched_at: Option<chrono::DateTime<Local>>,
     pub selected_jira_card: usize,
     pub acli_available: bool,
+    pub agenda_view_active: bool,
+    pub agenda_events: Vec<CalendarEvent>,
+    pub agenda_loading: bool,
+    pub agenda_error: Option<String>,
+    pub agenda_fetched_at: Option<chrono::DateTime<Local>>,
+    pub selected_agenda_item: usize,
+    pub gws_available: bool,
     pub all_view_active: bool,
     pub selected_all_item: usize,
     /// When the detail pane is open, this is the ID of the task being
@@ -504,6 +536,11 @@ pub struct App {
     /// cadence for one user. Default 10s.
     pub jira_cards_poll_interval_secs: u64,
     pending_jira_poll: bool,
+    /// Background poll interval for `gws calendar events list` (seconds).
+    /// Calendar events change slowly compared to PRs or tasks, and Google
+    /// Calendar's per-user quota is generous. Default 300s = 5 min.
+    pub agenda_poll_interval_secs: u64,
+    pending_agenda_poll: bool,
     comments_fetch_seq: u64,
     websocket_url: Option<String>,
     pending_commands: Vec<SyncCommand>,
@@ -579,6 +616,22 @@ fn load_jira_cards_poll_interval_secs() -> u64 {
         return secs.max(5);
     }
     DEFAULT_JIRA_CARDS_POLL_INTERVAL_SECS
+}
+
+/// Default background poll interval for `gws calendar events list`.
+/// Calendar events rarely change minute-to-minute, so a slower cadence is
+/// fine and friendlier to the Calendar API quota.
+const DEFAULT_AGENDA_POLL_INTERVAL_SECS: u64 = 300;
+
+fn load_agenda_poll_interval_secs() -> u64 {
+    let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
+    if let Ok(src) = std::fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&src)
+        && let Some(secs) = val["agenda_poll_interval_secs"].as_u64()
+    {
+        return secs.max(30);
+    }
+    DEFAULT_AGENDA_POLL_INTERVAL_SECS
 }
 
 fn load_idle_timeout_secs() -> u64 {
@@ -664,6 +717,7 @@ impl App {
             "hidden_pr_orgs": hidden,
             "github_prs_poll_interval_secs": self.github_prs_poll_interval_secs,
             "jira_cards_poll_interval_secs": self.jira_cards_poll_interval_secs,
+            "agenda_poll_interval_secs": self.agenda_poll_interval_secs,
         });
         let _ = std::fs::write(
             &path,
@@ -767,6 +821,13 @@ impl App {
             jira_cards_fetched_at: None,
             selected_jira_card: 0,
             acli_available: binary_available("acli"),
+            agenda_view_active: false,
+            agenda_events: Vec::new(),
+            agenda_loading: false,
+            agenda_error: None,
+            agenda_fetched_at: None,
+            selected_agenda_item: 0,
+            gws_available: binary_available("gws"),
             // Start on the All view — it's the primary landing page (first
             // sidebar entry) and surfaces Today's tasks, open PRs, and Jira
             // cards in one place.
@@ -780,6 +841,8 @@ impl App {
             pending_pr_poll: false,
             jira_cards_poll_interval_secs: load_jira_cards_poll_interval_secs(),
             pending_jira_poll: false,
+            agenda_poll_interval_secs: load_agenda_poll_interval_secs(),
+            pending_agenda_poll: false,
             comments_fetch_seq: 0,
             websocket_url: None,
             pending_commands: Vec::new(),
@@ -862,11 +925,18 @@ impl App {
         {
             self.spawn_jira_cards_fetch();
         }
+        if self.gws_available
+            && self.agenda_events.is_empty()
+            && self.agenda_fetched_at.is_none()
+        {
+            self.spawn_agenda_fetch();
+        }
 
         while self.running {
             self.drain_bg_results();
             self.maybe_poll_github_prs();
             self.maybe_poll_jira_cards();
+            self.maybe_poll_agenda();
 
             terminal.draw(|frame| ui::draw(frame, self))?;
 
@@ -886,6 +956,10 @@ impl App {
                 if was_idle && self.pending_jira_poll {
                     self.pending_jira_poll = false;
                     self.spawn_jira_cards_fetch();
+                }
+                if was_idle && self.pending_agenda_poll {
+                    self.pending_agenda_poll = false;
+                    self.spawn_agenda_fetch();
                 }
 
                 if self.error.is_some() {
@@ -910,6 +984,11 @@ impl App {
                     KeyAction::RefreshAllSources => self.refresh_all_sources(),
                     KeyAction::OpenSelectedJiraCardInBrowser => {
                         self.open_selected_jira_card_in_browser()
+                    }
+                    KeyAction::AgendaViewSelected => self.activate_agenda_view(),
+                    KeyAction::RefreshAgenda => self.refresh_agenda(),
+                    KeyAction::OpenSelectedAgendaEventInBrowser => {
+                        self.open_selected_event_in_browser()
                     }
                     KeyAction::ToggleOverdueSection => self.toggle_overdue_section(),
                     KeyAction::OpenDetail => self.open_detail(),
@@ -1389,6 +1468,24 @@ impl App {
                     }
                 }
 
+                BgResult::AgendaFetched(result) => {
+                    self.agenda_loading = false;
+                    self.agenda_fetched_at = Some(Local::now());
+                    match result {
+                        Ok(events) => {
+                            self.agenda_events = events;
+                            self.selected_agenda_item = self
+                                .selected_agenda_item
+                                .min(self.agenda_events.len().saturating_sub(1));
+                            self.agenda_error = None;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "agenda fetch failed");
+                            self.agenda_error = Some(e.to_string());
+                        }
+                    }
+                }
+
                 BgResult::Comments {
                     task_id,
                     comments,
@@ -1496,14 +1593,22 @@ impl App {
         self.upcoming_view_active = false;
         self.active_pr_org = None;
         self.jira_cards_view_active = false;
+        self.agenda_view_active = false;
         self.selected_all_item = 0;
     }
 
-    /// Build the combined item list for the All view. Today tasks first, then
-    /// non-hidden PRs, then Jira cards. Indices point into the respective
-    /// source collections at call time.
+    /// Build the combined item list for the All view. Today's calendar
+    /// events first (they're time-bound and the most time-sensitive thing
+    /// on the list), then Today tasks, then non-hidden PRs, then Jira
+    /// cards. Indices point into the respective source collections at
+    /// call time.
     pub fn all_view_items(&self) -> Vec<AllViewItem> {
         let mut items = Vec::new();
+
+        // Today's agenda events, in the order the API returned (startTime).
+        for (i, _) in self.agenda_events.iter().enumerate() {
+            items.push(AllViewItem::AgendaEvent(i));
+        }
 
         // Today tasks (same filter as Today view, minus overdue-collapse).
         let today = crate::ui::dates::today_str();
@@ -1595,9 +1700,29 @@ impl App {
         self.spawn_jira_cards_fetch();
     }
 
+    /// Mirror of `maybe_poll_github_prs` for agenda events.
+    fn maybe_poll_agenda(&mut self) {
+        if !self.gws_available || self.agenda_loading {
+            return;
+        }
+        let elapsed_secs = self
+            .agenda_fetched_at
+            .map(|at| (Local::now() - at).num_seconds())
+            .unwrap_or(i64::MAX);
+        if elapsed_secs < self.agenda_poll_interval_secs as i64 {
+            return;
+        }
+        if self.is_idle() {
+            self.pending_agenda_poll = true;
+            return;
+        }
+        self.spawn_agenda_fetch();
+    }
+
     pub fn refresh_all_sources(&mut self) {
         self.spawn_github_prs_fetch();
         self.spawn_jira_cards_fetch();
+        self.spawn_agenda_fetch();
     }
 
     fn switch_to_project_tasks(&mut self) {
@@ -1605,6 +1730,7 @@ impl App {
         self.upcoming_view_active = false;
         self.active_pr_org = None;
         self.jira_cards_view_active = false;
+        self.agenda_view_active = false;
         self.all_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
@@ -1616,6 +1742,7 @@ impl App {
         self.upcoming_view_active = false;
         self.active_pr_org = None;
         self.jira_cards_view_active = false;
+        self.agenda_view_active = false;
         self.all_view_active = false;
         self.overdue_section_collapsed = false;
         self.selected_task = 0;
@@ -1646,6 +1773,7 @@ impl App {
         self.upcoming_view_active = true;
         self.active_pr_org = None;
         self.jira_cards_view_active = false;
+        self.agenda_view_active = false;
         self.all_view_active = false;
         self.selected_task = 0;
         self.detail_scroll = 0;
@@ -1657,6 +1785,7 @@ impl App {
         self.upcoming_view_active = false;
         self.active_pr_org = Some(owner);
         self.jira_cards_view_active = false;
+        self.agenda_view_active = false;
         self.all_view_active = false;
         self.selected_pr = 0;
         // No fetch here — the initial fetch runs once on App::new().
@@ -1669,6 +1798,7 @@ impl App {
         self.upcoming_view_active = false;
         self.active_pr_org = None;
         self.jira_cards_view_active = true;
+        self.agenda_view_active = false;
         self.all_view_active = false;
         self.selected_jira_card = 0;
         self.spawn_jira_cards_fetch();
@@ -1705,6 +1835,61 @@ impl App {
         tokio::spawn(async move {
             let result = fetch_jira_cards().await;
             let _ = tx.send(BgResult::JiraCardsFetched(result)).await;
+        });
+    }
+
+    pub fn activate_agenda_view(&mut self) {
+        tracing::debug!("agenda view activated");
+        self.today_view_active = false;
+        self.upcoming_view_active = false;
+        self.active_pr_org = None;
+        self.jira_cards_view_active = false;
+        self.agenda_view_active = true;
+        self.all_view_active = false;
+        self.selected_agenda_item = 0;
+        self.spawn_agenda_fetch();
+    }
+
+    pub fn refresh_agenda(&mut self) {
+        if self.agenda_view_active {
+            self.spawn_agenda_fetch();
+        }
+    }
+
+    pub fn open_selected_event_in_browser(&mut self) {
+        // On the All view `selected_agenda_item` is a raw index into
+        // `agenda_events`; inside the Agenda view it's also a raw index
+        // (no filtering). Single helper for both paths.
+        let Some(event) = self.agenda_events.get(self.selected_agenda_item) else {
+            return;
+        };
+        let url = event.html_link.clone();
+        if url.is_empty() {
+            return;
+        }
+        // `open` is the macOS default-browser launcher. On other platforms
+        // the binary is absent; if this ever ships cross-platform we'd
+        // switch to a conditional.
+        tokio::spawn(async move {
+            let _ = tokio::process::Command::new("open")
+                .arg(url)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        });
+    }
+
+    fn spawn_agenda_fetch(&mut self) {
+        if self.agenda_loading {
+            return;
+        }
+        self.agenda_loading = true;
+        self.agenda_error = None;
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = fetch_agenda_events().await;
+            let _ = tx.send(BgResult::AgendaFetched(result)).await;
         });
     }
 
@@ -2310,6 +2495,9 @@ impl App {
                     if self.acli_available {
                         entries.push(ProjectEntry::JiraCardsView);
                     }
+                    if self.gws_available {
+                        entries.push(ProjectEntry::AgendaView);
+                    }
                 }
             }
         }
@@ -2351,6 +2539,7 @@ impl App {
                 ProjectEntry::UpcomingView => Some(ProjectNavItem::UpcomingView),
                 ProjectEntry::GithubPrsView(owner) => Some(ProjectNavItem::GithubPrsView(owner)),
                 ProjectEntry::JiraCardsView => Some(ProjectNavItem::JiraCardsView),
+                ProjectEntry::AgendaView => Some(ProjectNavItem::AgendaView),
                 _ => None,
             })
             .collect()
@@ -2526,6 +2715,7 @@ impl App {
             || self.upcoming_view_active
             || self.active_pr_org.is_some()
             || self.jira_cards_view_active
+            || self.agenda_view_active
     }
 
     /// Any Pull Requests view (for some specific org) is currently active.
@@ -2579,6 +2769,9 @@ impl App {
         }
         if self.jira_cards_view_active {
             return "Jira Cards".into();
+        }
+        if self.agenda_view_active {
+            return "Agenda".into();
         }
         self.projects
             .get(self.selected_project)
@@ -3266,6 +3459,121 @@ async fn fetch_jira_cards() -> Result<Vec<JiraCard>> {
     Ok(cards)
 }
 
+/// Shell out to `gws calendar events list` for today's window on the
+/// primary calendar and parse the result into `CalendarEvent` records.
+/// Errors (missing gws, auth failure, network) surface as the error
+/// message. "Today" is computed in the user's local timezone.
+async fn fetch_agenda_events() -> Result<Vec<CalendarEvent>> {
+    use chrono::{Local, TimeZone};
+    use tokio::process::Command;
+
+    // 00:00 local today → 00:00 local tomorrow, as RFC3339 strings with the
+    // local offset. Calendar events-list honors this window and expands
+    // recurring events when `singleEvents=true`.
+    let now = Local::now();
+    let today = now.date_naive();
+    let tomorrow = today + chrono::Duration::days(1);
+    let start_local = Local
+        .from_local_datetime(&today.and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("ambiguous local midnight today"))?;
+    let end_local = Local
+        .from_local_datetime(&tomorrow.and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("ambiguous local midnight tomorrow"))?;
+    let time_min = start_local.to_rfc3339();
+    let time_max = end_local.to_rfc3339();
+
+    let params = serde_json::json!({
+        "calendarId": "primary",
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "singleEvents": true,
+        "orderBy": "startTime",
+        "maxResults": 100,
+    });
+
+    let output = Command::new("gws")
+        .args(["calendar", "events", "list", "--params"])
+        .arg(params.to_string())
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to invoke gws: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if stderr.is_empty() {
+            format!("gws exited with status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(anyhow::anyhow!("{msg}"));
+    }
+
+    // Response shape: `{ "items": [ {...event...}, ... ] }`.
+    // `start` is either `{"dateTime": "..."}` (timed) or `{"date": "..."}`
+    // (all-day). Same for `end`.
+    let raw: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("gws JSON parse error: {e}"))?;
+
+    let empty = vec![];
+    let items = raw
+        .get("items")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+
+    let mut events = Vec::with_capacity(items.len());
+    for item in items {
+        // Skip cancelled instances of recurring events — the API returns
+        // them as ghosts with status=cancelled.
+        if item.get("status").and_then(|s| s.as_str()) == Some("cancelled") {
+            continue;
+        }
+        let start_obj = item.get("start");
+        let end_obj = item.get("end");
+        let (start, all_day) = extract_time(start_obj);
+        let (end, _) = extract_time(end_obj);
+        events.push(CalendarEvent {
+            summary: item
+                .get("summary")
+                .and_then(|s| s.as_str())
+                .unwrap_or("(no title)")
+                .to_string(),
+            start,
+            end,
+            all_day,
+            location: item
+                .get("location")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            html_link: item
+                .get("htmlLink")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(events)
+}
+
+/// Pull a start/end timestamp out of a Google Calendar event's
+/// `start` / `end` object. Returns the timestamp string plus a flag
+/// indicating whether this was an all-day event (`date`) versus a timed
+/// event (`dateTime`).
+fn extract_time(obj: Option<&serde_json::Value>) -> (String, bool) {
+    let Some(obj) = obj else {
+        return (String::new(), false);
+    };
+    if let Some(dt) = obj.get("dateTime").and_then(|v| v.as_str()) {
+        return (dt.to_string(), false);
+    }
+    if let Some(d) = obj.get("date").and_then(|v| v.as_str()) {
+        return (d.to_string(), true);
+    }
+    (String::new(), false)
+}
+
 async fn run_websocket(url: String, tx: mpsc::Sender<BgResult>) {
     use futures_util::StreamExt;
     use tokio_tungstenite::connect_async_tls_with_config;
@@ -3864,6 +4172,7 @@ mod tests {
         });
         app.gh_available = false;
         app.acli_available = false;
+        app.gws_available = false;
 
         let entries = app.project_list_entries();
         let has_prs = entries
@@ -3872,8 +4181,12 @@ mod tests {
         let has_jira = entries
             .iter()
             .any(|e| matches!(e, ProjectEntry::JiraCardsView));
+        let has_agenda = entries
+            .iter()
+            .any(|e| matches!(e, ProjectEntry::AgendaView));
         assert!(!has_prs, "PRs hidden when gh missing");
         assert!(!has_jira, "Jira hidden when acli missing");
+        assert!(!has_agenda, "Agenda hidden when gws missing");
 
         app.gh_available = true;
         // Still no PR entry — gh is available but there are no PRs yet.
@@ -3932,6 +4245,87 @@ mod tests {
         app.activate_upcoming_view();
         assert!(app.upcoming_view_active);
         assert!(!app.is_pr_view_active());
+    }
+
+    /// Agenda events land in the All view under their own section and in
+    /// the expected order (agenda first, then today's tasks). Verified by
+    /// populating both and asserting the AllViewItem sequence — we don't
+    /// call `activate_agenda_view` here because that would spawn a tokio
+    /// fetch and we're running without a runtime.
+    #[test]
+    fn all_view_interleaves_agenda_events_before_tasks() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.tasks.push(Task {
+            id: "t1".to_string(),
+            content: "Today task".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                is_recurring: false,
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.agenda_events.push(CalendarEvent {
+            summary: "Standup".to_string(),
+            start: "2026-04-17T09:00:00-04:00".to_string(),
+            end: "2026-04-17T09:30:00-04:00".to_string(),
+            all_day: false,
+            location: String::new(),
+            html_link: "https://calendar.google.com/event?eid=abc".to_string(),
+        });
+        app.agenda_events.push(CalendarEvent {
+            summary: "Dentist".to_string(),
+            start: "2026-04-17T14:00:00-04:00".to_string(),
+            end: "2026-04-17T15:00:00-04:00".to_string(),
+            all_day: false,
+            location: "Main St.".to_string(),
+            html_link: "https://calendar.google.com/event?eid=def".to_string(),
+        });
+
+        let items = app.all_view_items();
+        // Expected: two AgendaEvent (indices 0 and 1) then one Task (index 0).
+        assert_eq!(items.len(), 3, "one task + two events");
+        assert!(matches!(items[0], AllViewItem::AgendaEvent(0)));
+        assert!(matches!(items[1], AllViewItem::AgendaEvent(1)));
+        assert!(matches!(items[2], AllViewItem::Task(_)));
+    }
+
+    /// With `gws_available = true` the Agenda sidebar entry appears under
+    /// Inbox; with `gws_available = false` it's hidden. Mirrors the Jira
+    /// gating test.
+    #[test]
+    fn agenda_sidebar_entry_gated_by_gws_available() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "inbox".to_string(),
+            name: "Inbox".to_string(),
+            inbox_project: Some(true),
+            ..Project::default()
+        });
+        app.gh_available = false;
+        app.acli_available = false;
+
+        app.gws_available = false;
+        assert!(
+            !app.project_list_entries()
+                .iter()
+                .any(|e| matches!(e, ProjectEntry::AgendaView)),
+            "Agenda hidden when gws missing"
+        );
+
+        app.gws_available = true;
+        assert!(
+            app.project_list_entries()
+                .iter()
+                .any(|e| matches!(e, ProjectEntry::AgendaView)),
+            "Agenda appears once gws is detected"
+        );
     }
 
     /// Hidden owners drop out of pr_owners_with_counts, so they no longer

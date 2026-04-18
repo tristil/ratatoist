@@ -74,6 +74,11 @@ must include a spec update in the same PR:
 
 If unsure which spec to update, grep `specifications/` for keywords from the change.
 
+**Order of operations:** spec first, then code. The `/spec-first <description>` slash
+command (`.claude/commands/spec-first.md`) enforces this — use it for any change that
+touches behavior, display, or actions. Bug fixes that don't change behavior can skip
+the spec step; see the command's escape hatch.
+
 ## Edition & syntax
 
 - Workspace is Rust **edition 2024**; let-chains (`if let Some(x) = … && cond`) are in use, prefer them over nested `if let`.

@@ -18,6 +18,7 @@ A virtual sidebar entry below Inbox showing all overdue and due-today tasks acro
 - Only includes tasks where `responsible_uid` is `None` (personal) or matches the current user (assigned to me in shared projects).
 - Excludes completed and deleted tasks.
 - Excludes subtasks (parent tasks only).
+- **Hides tasks labeled `evening` until 17:00 local time.** Evening tasks clutter daytime planning; they reappear on Today (and the All view) once the local hour hits 17. Exact lowercase match only (`Evening` is not filtered). Other views (Upcoming, project lists) always show them.
 
 ## Out of Scope (v1)
 

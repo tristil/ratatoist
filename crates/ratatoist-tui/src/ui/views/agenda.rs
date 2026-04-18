@@ -93,6 +93,17 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         .unwrap_or(8)
         + 2;
 
+    // Only surface the calendar-name chip when more than one calendar is
+    // represented in today's list. If every event is from the same
+    // calendar, the chip is redundant noise.
+    let distinct_calendars: std::collections::HashSet<&str> = app
+        .agenda_events
+        .iter()
+        .map(|e| e.calendar_name.as_str())
+        .filter(|n| !n.is_empty())
+        .collect();
+    let show_calendar_chip = distinct_calendars.len() > 1;
+
     let mut items: Vec<ListItem> = Vec::new();
     let mut visual_selected: Option<usize> = None;
 
@@ -103,6 +114,12 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         spans.push(Span::styled(time, theme.key_hint()));
         spans.push(Span::styled(" ".repeat(pad), theme.muted_text()));
         spans.push(Span::styled(&event.summary, theme.normal_text()));
+        if show_calendar_chip && !event.calendar_name.is_empty() {
+            spans.push(Span::styled(
+                format!("  · {}", event.calendar_name),
+                theme.muted_text(),
+            ));
+        }
         if !event.location.is_empty() {
             spans.push(Span::styled(
                 format!("  · {}", event.location),

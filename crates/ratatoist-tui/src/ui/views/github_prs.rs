@@ -93,6 +93,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         } else {
             spans.push(Span::styled("● ", theme.success()));
         }
+        spans.push(crate::ui::check_status_span(pr.check_status, theme));
         spans.push(Span::styled(
             format!("#{}  ", pr.number),
             theme.muted_text(),

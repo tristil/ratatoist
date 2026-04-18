@@ -15,8 +15,23 @@ pub const LOGO: &str = r#"
 "#;
 
 use ratatui::Frame;
+use ratatui::text::Span;
 
-use crate::app::App;
+use crate::app::{App, CheckStatus};
+use crate::ui::theme::Theme;
+
+/// Glyph + color for a PR's CI rollup state. Returned as a span already
+/// styled by the theme so render sites can just push it. Always emits a
+/// two-column-wide span (glyph + trailing space) so row alignment stays
+/// consistent whether the status is known or not.
+pub fn check_status_span<'a>(status: Option<CheckStatus>, theme: &Theme) -> Span<'a> {
+    match status {
+        Some(CheckStatus::Success) => Span::styled("✓ ", theme.success()),
+        Some(CheckStatus::Failure) => Span::styled("✗ ", theme.due_overdue()),
+        Some(CheckStatus::Pending) => Span::styled("· ", theme.muted_text()),
+        None => Span::styled("  ", theme.muted_text()),
+    }
+}
 
 pub fn draw(frame: &mut Frame, app: &App) {
     layout::render(frame, app);

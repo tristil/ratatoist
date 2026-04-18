@@ -175,6 +175,7 @@ fn build_pr_row<'a>(app: &'a App, pr_idx: usize, theme: &Theme) -> ListItem<'a> 
     } else {
         spans.push(Span::styled("● ", theme.success()));
     }
+    spans.push(crate::ui::check_status_span(pr.check_status, theme));
     spans.push(Span::styled(
         format!("{}/#{} ", pr.repo_full_name, pr.number),
         theme.muted_text(),

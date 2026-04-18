@@ -559,6 +559,12 @@ pub struct App {
     /// users who installed `gws` without authorizing calendar access don't
     /// see a view that can't load. Probed once at startup.
     pub gws_available: bool,
+    /// Whether the StatsDock block is rendered in the left sidebar. Off by
+    /// default — the dashboard is enough for most users and the block
+    /// eats four rows. Persisted in `ui_settings.json` under `show_stats`;
+    /// also gates Tab / j-past-end focus transitions so a hidden block
+    /// doesn't capture focus.
+    pub show_stats: bool,
     /// Running tally of task completions for the local day. Incremented on
     /// every `item_close` enqueue (non-recurring or recurring), not
     /// decremented on `item_reopen` — the jar is a one-way record of effort.
@@ -690,6 +696,20 @@ fn load_agenda_poll_interval_secs() -> u64 {
     DEFAULT_AGENDA_POLL_INTERVAL_SECS
 }
 
+/// Whether the StatsDock block should render. Defaults to `false` when
+/// absent (explicit opt-in) so new users / new installs start with the
+/// leaner sidebar.
+fn load_show_stats() -> bool {
+    let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
+    if let Ok(src) = std::fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&src)
+        && let Some(b) = val["show_stats"].as_bool()
+    {
+        return b;
+    }
+    false
+}
+
 /// Load today's star jar from disk. Returns `(count, date)` where `date` is
 /// always today's local `YYYY-MM-DD`: if the persisted entry is from a
 /// previous day (or no entry exists), the count is zero and the date is
@@ -792,6 +812,7 @@ impl App {
             "github_prs_poll_interval_secs": self.github_prs_poll_interval_secs,
             "jira_cards_poll_interval_secs": self.jira_cards_poll_interval_secs,
             "agenda_poll_interval_secs": self.agenda_poll_interval_secs,
+            "show_stats": self.show_stats,
             "star_count": self.star_count,
             "star_date": self.star_date,
         });
@@ -852,6 +873,7 @@ impl App {
         };
         let idle_timeout_secs = load_idle_timeout_secs();
         let (star_count, star_date) = load_star_jar();
+        let show_stats = load_show_stats();
 
         Self {
             projects: Vec::new(),
@@ -925,6 +947,7 @@ impl App {
             agenda_fetched_at: None,
             selected_agenda_item: 0,
             gws_available: gws_calendar_configured(),
+            show_stats,
             star_count,
             star_date,
             // Start on the All view — it's the primary landing page (first
@@ -4533,6 +4556,37 @@ mod tests {
             entries
                 .iter()
                 .any(|e| matches!(e, ProjectEntry::JiraCardsView))
+        );
+    }
+
+    /// When `show_stats` is false, Tab out of Tasks must never land on
+    /// the hidden StatsDock pane — it wraps back to Projects instead.
+    /// Conversely, with `show_stats = true` the old behavior stands:
+    /// Tab from Tasks descends into StatsDock. BackTab from Projects is
+    /// symmetric.
+    #[test]
+    fn show_stats_false_skips_stats_pane_on_tab() {
+        let mut app = test_app();
+        app.show_stats = false;
+        app.active_pane = Pane::Tasks;
+        press(&mut app, KeyCode::Tab);
+        assert!(
+            matches!(app.active_pane, Pane::Projects),
+            "Tab from Tasks wraps to Projects when Stats hidden"
+        );
+        app.active_pane = Pane::Projects;
+        press(&mut app, KeyCode::BackTab);
+        assert!(
+            matches!(app.active_pane, Pane::Tasks),
+            "BackTab from Projects wraps to Tasks when Stats hidden"
+        );
+
+        app.show_stats = true;
+        app.active_pane = Pane::Tasks;
+        press(&mut app, KeyCode::Tab);
+        assert!(
+            matches!(app.active_pane, Pane::StatsDock),
+            "Tab from Tasks descends into Stats when shown"
         );
     }
 

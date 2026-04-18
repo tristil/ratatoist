@@ -105,13 +105,16 @@ pub fn render(frame: &mut Frame, app: &App) {
     let stats_active = matches!(app.active_pane, Pane::StatsDock);
     let settings_active = matches!(app.active_pane, Pane::Settings);
 
-    // Budget the jar may occupy before collapsing. Reserve Stats, the
-    // jar's own borders, optional settings block, and a floor of project
-    // rows; whatever's left becomes the max body height for the jar.
+    // Budget the jar may occupy before collapsing. Reserve Stats (if
+    // shown), the jar's own borders, optional settings block, and a floor
+    // of project rows; whatever's left becomes the max body height for the
+    // jar. When Stats is hidden via `show_stats=false`, those four rows
+    // go to the project list (and, if the jar needs to grow, to the jar).
+    let stats_rows: u16 = if app.show_stats { STATS_HEIGHT } else { 0 };
     let settings_rows: u16 = if app.show_settings { 5 } else { 0 };
     let max_body = left_area
         .height
-        .saturating_sub(STATS_HEIGHT)
+        .saturating_sub(stats_rows)
         .saturating_sub(STAR_JAR_BORDER_ROWS)
         .saturating_sub(settings_rows)
         .saturating_sub(STAR_JAR_PROJECT_FLOOR)
@@ -119,30 +122,44 @@ pub fn render(frame: &mut Frame, app: &App) {
     let plan = plan_star_jar(left_area.width, max_body, app.star_count);
     let jar_height = plan.body_rows.saturating_add(STAR_JAR_BORDER_ROWS);
 
+    // Build the left-column constraints dynamically: the Stats and
+    // Settings slots are elided entirely when their feature flag is off,
+    // so the corresponding pane can never capture focus of a block that
+    // isn't on screen.
+    let mut constraints: Vec<Constraint> = vec![Constraint::Min(1)];
+    if app.show_stats {
+        constraints.push(Constraint::Length(STATS_HEIGHT));
+    }
+    constraints.push(Constraint::Length(jar_height));
     if app.show_settings {
-        let [projects_area, stats_area, star_area, settings_area] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(STATS_HEIGHT),
-            Constraint::Length(jar_height),
-            Constraint::Length(settings_rows),
-        ])
-        .areas(left_area);
-
-        render_projects_block(frame, app, projects_area, projects_active);
-        render_stats_block(frame, app, stats_area, stats_active);
-        render_star_jar_block(frame, app, star_area, &plan);
-        views::settings::render(frame, app, settings_area, settings_active);
+        constraints.push(Constraint::Length(settings_rows));
+    }
+    let areas = Layout::vertical(constraints).split(left_area);
+    let mut idx = 0;
+    let projects_area = areas[idx];
+    idx += 1;
+    let stats_area = if app.show_stats {
+        let a = areas[idx];
+        idx += 1;
+        Some(a)
     } else {
-        let [projects_area, stats_area, star_area] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(STATS_HEIGHT),
-            Constraint::Length(jar_height),
-        ])
-        .areas(left_area);
+        None
+    };
+    let star_area = areas[idx];
+    idx += 1;
+    let settings_area = if app.show_settings {
+        Some(areas[idx])
+    } else {
+        None
+    };
 
-        render_projects_block(frame, app, projects_area, projects_active);
+    render_projects_block(frame, app, projects_area, projects_active);
+    if let Some(stats_area) = stats_area {
         render_stats_block(frame, app, stats_area, stats_active);
-        render_star_jar_block(frame, app, star_area, &plan);
+    }
+    render_star_jar_block(frame, app, star_area, &plan);
+    if let Some(settings_area) = settings_area {
+        views::settings::render(frame, app, settings_area, settings_active);
     }
 
     if matches!(app.active_pane, Pane::Detail) {

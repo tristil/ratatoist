@@ -7,6 +7,7 @@ use ratatui::widgets::{List, ListItem, ListState};
 use crate::app::{AllViewItem, App};
 use crate::ui::dates;
 use crate::ui::theme::Theme;
+use crate::ui::views::tasks::label_spans;
 
 /// Rough relative-time formatter for PR timestamps (duplicated from
 /// github_prs.rs to avoid a public export for a 10-line helper).
@@ -154,6 +155,8 @@ fn build_task_row<'a>(app: &'a App, task_idx: usize, theme: &Theme) -> ListItem<
         theme.priority_style(task.priority),
     ));
     spans.push(Span::styled(&task.content, theme.normal_text()));
+
+    spans.extend(label_spans(app, task, theme));
 
     if task.due.as_ref().is_some_and(|d| d.is_recurring) {
         spans.push(Span::styled("  ↻", theme.muted_text()));

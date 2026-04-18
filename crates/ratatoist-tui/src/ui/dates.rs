@@ -84,6 +84,23 @@ pub fn evening_task_hidden(labels: &[String], current_hour: u32) -> bool {
     current_hour < 17 && labels.iter().any(|l| l == "evening")
 }
 
+/// True when the local date is Saturday or Sunday. Read once per
+/// filter-pass so all same-frame checks agree.
+pub fn is_weekend_local() -> bool {
+    use chrono::Datelike;
+    matches!(
+        chrono::Local::now().date_naive().weekday(),
+        chrono::Weekday::Sat | chrono::Weekday::Sun
+    )
+}
+
+/// True when a task carries the `work` label and today is Saturday or
+/// Sunday. Mirrors `evening_task_hidden` — pass the weekend flag so tests
+/// can exercise both sides without manipulating the clock.
+pub fn work_weekend_hidden(labels: &[String], is_weekend: bool) -> bool {
+    is_weekend && labels.iter().any(|l| l == "work")
+}
+
 /// Format a `YYYY-MM-DD` date as a section header for the Upcoming view,
 /// matching Todoist's style: `"15 Apr · Today · Wednesday"`,
 /// `"16 Apr · Tomorrow · Thursday"`, or `"17 Apr · Friday"` for dates farther
@@ -204,6 +221,25 @@ mod tests {
         // Exact lowercase only — "Evening" is not matched.
         let capitalized = vec!["Evening".to_string()];
         assert!(!evening_task_hidden(&capitalized, 9));
+    }
+
+    #[test]
+    fn work_label_hidden_on_weekend_and_visible_weekdays() {
+        let work = vec!["work".to_string()];
+        let personal = vec!["home".to_string()];
+        let none: Vec<String> = vec![];
+
+        // Weekend — work hidden, others visible.
+        assert!(work_weekend_hidden(&work, true));
+        assert!(!work_weekend_hidden(&personal, true));
+        assert!(!work_weekend_hidden(&none, true));
+
+        // Weekday — nothing hidden by this rule.
+        assert!(!work_weekend_hidden(&work, false));
+
+        // Exact lowercase only — "Work" is not matched.
+        let capitalized = vec!["Work".to_string()];
+        assert!(!work_weekend_hidden(&capitalized, true));
     }
 
     #[test]

@@ -7,6 +7,9 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use crate::app::{App, DOCK_ITEMS, DockItem, Pane, SortMode, TaskFilter};
 
 const STATS_HEIGHT: u16 = 4;
+/// Bordered block at the bottom of the left column: 1 top border + 1 body
+/// line + 1 bottom border. See [`star-jar.spec.md`](../../../specifications/star-jar.spec.md).
+const STAR_JAR_HEIGHT: u16 = 3;
 use crate::ui::theme::Theme;
 
 use super::keyhints;
@@ -33,23 +36,29 @@ pub fn render(frame: &mut Frame, app: &App) {
     let settings_active = matches!(app.active_pane, Pane::Settings);
 
     if app.show_settings {
-        let [projects_area, stats_area, settings_area] = Layout::vertical([
+        let [projects_area, stats_area, star_area, settings_area] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(STATS_HEIGHT),
+            Constraint::Length(STAR_JAR_HEIGHT),
             Constraint::Length(5),
         ])
         .areas(left_area);
 
         render_projects_block(frame, app, projects_area, projects_active);
         render_stats_block(frame, app, stats_area, stats_active);
+        render_star_jar_block(frame, app, star_area);
         views::settings::render(frame, app, settings_area, settings_active);
     } else {
-        let [projects_area, stats_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(STATS_HEIGHT)])
-                .areas(left_area);
+        let [projects_area, stats_area, star_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(STATS_HEIGHT),
+            Constraint::Length(STAR_JAR_HEIGHT),
+        ])
+        .areas(left_area);
 
         render_projects_block(frame, app, projects_area, projects_active);
         render_stats_block(frame, app, stats_area, stats_active);
+        render_star_jar_block(frame, app, star_area);
     }
 
     if matches!(app.active_pane, Pane::Detail) {
@@ -258,6 +267,35 @@ fn render_filter_row(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Passive counter block at the bottom of the left sidebar. One star per
+/// task completion, resets at local midnight. No focus, no keybinding —
+/// never takes an `active` flag. See
+/// [`star-jar.spec.md`](../../../specifications/star-jar.spec.md).
+fn render_star_jar_block(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let block = Block::default()
+        .title(" Star jar ")
+        .title_style(theme.title())
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(theme.inactive_border())
+        .padding(Padding::horizontal(1))
+        .style(theme.base_bg());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let line = if app.star_count == 0 {
+        Line::from(Span::styled("—", theme.muted_text()))
+    } else {
+        Line::from(vec![
+            Span::styled("★ ", Style::default().fg(Color::Yellow)),
+            Span::styled(app.star_count.to_string(), theme.normal_text()),
+            Span::styled(" today", theme.muted_text()),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), inner);
 }
 
 fn render_stats_block(frame: &mut Frame, app: &App, area: Rect, active: bool) {

@@ -24,6 +24,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
             app.active_pr_org.as_deref() == Some(owner.as_str()) && app.folder_cursor.is_none()
         }
         ProjectEntry::JiraCardsView => app.jira_cards_view_active && app.folder_cursor.is_none(),
+        ProjectEntry::AgendaView => app.agenda_view_active && app.folder_cursor.is_none(),
         _ => false,
     });
 
@@ -128,6 +129,19 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
                     Span::raw("  "),
                     Span::styled("▣ ", Style::default().fg(Color::Blue)),
                     Span::styled("Jira Cards", theme.normal_text()),
+                ];
+                if count > 0 {
+                    spans.push(Span::styled(format!("  {count}"), theme.muted_text()));
+                }
+                ListItem::new(Line::from(spans))
+            }
+
+            ProjectEntry::AgendaView => {
+                let count = app.agenda_events.len();
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled("◷ ", Style::default().fg(Color::Green)),
+                    Span::styled("Agenda", theme.normal_text()),
                 ];
                 if count > 0 {
                     spans.push(Span::styled(format!("  {count}"), theme.muted_text()));

@@ -43,7 +43,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         let lines = vec![
             ListItem::new(Line::default()),
             ListItem::new(Line::from(Span::styled(
-                "No items — tasks due today, open PRs, and Jira cards appear here.",
+                "No items — agenda events, tasks due today, open PRs, and Jira cards appear here.",
                 theme.muted_text(),
             ))),
         ];
@@ -56,6 +56,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
 
     #[derive(PartialEq)]
     enum Section {
+        Agenda,
         Task,
         Pr,
         Jira,
@@ -64,6 +65,22 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
 
     for (idx, item) in all_items.iter().enumerate() {
         match item {
+            AllViewItem::AgendaEvent(event_idx) => {
+                if last_section.as_ref() != Some(&Section::Agenda) {
+                    if !items.is_empty() {
+                        items.push(ListItem::new(Line::default()));
+                    }
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        "▸ Agenda",
+                        theme.success().add_modifier(Modifier::BOLD),
+                    ))));
+                    last_section = Some(Section::Agenda);
+                }
+                if idx == app.selected_all_item {
+                    visual_selected = Some(items.len());
+                }
+                items.push(build_agenda_row(app, *event_idx, theme));
+            }
             AllViewItem::Task(task_idx) => {
                 if last_section.as_ref() != Some(&Section::Task) {
                     if !items.is_empty() {
@@ -185,6 +202,46 @@ fn build_pr_row<'a>(app: &'a App, pr_idx: usize, theme: &Theme) -> ListItem<'a> 
         spans.push(Span::styled(format!("  · {rel}"), theme.muted_text()));
     }
     ListItem::new(Line::from(spans))
+}
+
+fn build_agenda_row<'a>(app: &'a App, event_idx: usize, theme: &Theme) -> ListItem<'a> {
+    let Some(event) = app.agenda_events.get(event_idx) else {
+        return ListItem::new(Line::default());
+    };
+    let time = agenda_time_label(event);
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    spans.push(Span::styled("  ", theme.muted_text()));
+    spans.push(Span::styled(
+        format!("{:<8}", time),
+        theme.key_hint(),
+    ));
+    spans.push(Span::styled(&event.summary, theme.normal_text()));
+    if !event.location.is_empty() {
+        spans.push(Span::styled(
+            format!("  · {}", event.location),
+            theme.muted_text(),
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+/// Compact time label for an agenda row: `"all day"` for all-day events,
+/// `"9"` or `"9:30"` for timed events parsed as local time.
+fn agenda_time_label(event: &crate::app::CalendarEvent) -> String {
+    if event.all_day {
+        return "all day".to_string();
+    }
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&event.start) else {
+        return event.start.clone();
+    };
+    let local = dt.with_timezone(&chrono::Local);
+    let hour = local.format("%H").to_string();
+    let minute = local.format("%M").to_string();
+    if minute == "00" {
+        hour
+    } else {
+        format!("{hour}:{minute}")
+    }
 }
 
 fn build_jira_row<'a>(app: &'a App, card_idx: usize, theme: &Theme) -> ListItem<'a> {

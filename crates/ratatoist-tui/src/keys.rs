@@ -49,6 +49,9 @@ pub enum KeyAction {
     JiraCardsViewSelected,
     RefreshJiraCards,
     OpenSelectedJiraCardInBrowser,
+    AgendaViewSelected,
+    RefreshAgenda,
+    OpenSelectedAgendaEventInBrowser,
     ToggleOverdueSection,
     Consumed,
     None,
@@ -420,6 +423,11 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
         {
             KeyAction::RefreshJiraCards
         }
+        KeyCode::Char('r')
+            if matches!(app.active_pane, Pane::Tasks) && app.agenda_view_active =>
+        {
+            KeyAction::RefreshAgenda
+        }
         KeyCode::Char('s') if matches!(app.active_pane, Pane::Projects) => KeyAction::StarProject,
 
         KeyCode::Char('j') | KeyCode::Down => move_in_pane(app, 1),
@@ -487,11 +495,16 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
                         app.selected_jira_card = *i;
                         KeyAction::OpenSelectedJiraCardInBrowser
                     }
+                    Some(crate::app::AllViewItem::AgendaEvent(i)) => {
+                        app.selected_agenda_item = *i;
+                        KeyAction::OpenSelectedAgendaEventInBrowser
+                    }
                     None => KeyAction::Consumed,
                 }
             }
             Pane::Tasks if app.is_pr_view_active() => KeyAction::OpenSelectedPrInBrowser,
             Pane::Tasks if app.jira_cards_view_active => KeyAction::OpenSelectedJiraCardInBrowser,
+            Pane::Tasks if app.agenda_view_active => KeyAction::OpenSelectedAgendaEventInBrowser,
             Pane::Tasks => KeyAction::OpenDetail,
             _ => KeyAction::Consumed,
         },
@@ -619,11 +632,16 @@ fn handle_standard(app: &mut App, key: KeyEvent) -> KeyAction {
                         app.selected_jira_card = *i;
                         KeyAction::OpenSelectedJiraCardInBrowser
                     }
+                    Some(crate::app::AllViewItem::AgendaEvent(i)) => {
+                        app.selected_agenda_item = *i;
+                        KeyAction::OpenSelectedAgendaEventInBrowser
+                    }
                     None => KeyAction::Consumed,
                 }
             }
             Pane::Tasks if app.is_pr_view_active() => KeyAction::OpenSelectedPrInBrowser,
             Pane::Tasks if app.jira_cards_view_active => KeyAction::OpenSelectedJiraCardInBrowser,
+            Pane::Tasks if app.agenda_view_active => KeyAction::OpenSelectedAgendaEventInBrowser,
             Pane::Tasks => KeyAction::OpenDetail,
             _ => KeyAction::Consumed,
         },
@@ -679,6 +697,9 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                     ProjectNavItem::JiraCardsView => {
                         app.jira_cards_view_active && app.folder_cursor.is_none()
                     }
+                    ProjectNavItem::AgendaView => {
+                        app.agenda_view_active && app.folder_cursor.is_none()
+                    }
                 })
                 .unwrap_or(0) as i32;
             let next_pos = pos + delta;
@@ -723,6 +744,10 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                     app.folder_cursor = None;
                     KeyAction::JiraCardsViewSelected
                 }
+                ProjectNavItem::AgendaView => {
+                    app.folder_cursor = None;
+                    KeyAction::AgendaViewSelected
+                }
             }
         }
         Pane::Tasks => {
@@ -742,6 +767,15 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                 }
                 let current = app.selected_jira_card as i32;
                 app.selected_jira_card = (current + delta).rem_euclid(len as i32) as usize;
+                return KeyAction::Consumed;
+            }
+            if app.agenda_view_active {
+                let len = app.agenda_events.len();
+                if len == 0 {
+                    return KeyAction::Consumed;
+                }
+                let current = app.selected_agenda_item as i32;
+                app.selected_agenda_item = (current + delta).rem_euclid(len as i32) as usize;
                 return KeyAction::Consumed;
             }
             if app.is_pr_view_active() {
@@ -812,6 +846,10 @@ fn jump_to_edge(app: &mut App, top: bool) -> KeyAction {
                 Some(ProjectNavItem::JiraCardsView) => {
                     app.folder_cursor = None;
                     return KeyAction::JiraCardsViewSelected;
+                }
+                Some(ProjectNavItem::AgendaView) => {
+                    app.folder_cursor = None;
+                    return KeyAction::AgendaViewSelected;
                 }
                 None => {}
             }

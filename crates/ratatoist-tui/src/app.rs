@@ -559,6 +559,15 @@ pub struct App {
     /// users who installed `gws` without authorizing calendar access don't
     /// see a view that can't load. Probed once at startup.
     pub gws_available: bool,
+    /// Running tally of task completions for the local day. Incremented on
+    /// every `item_close` enqueue (non-recurring or recurring), not
+    /// decremented on `item_reopen` — the jar is a one-way record of effort.
+    /// Persisted in `ui_settings.json` alongside `star_date`; see
+    /// [`star-jar.spec.md`](../../../specifications/star-jar.spec.md).
+    pub star_count: u64,
+    /// Local date (YYYY-MM-DD) of the stored `star_count`. When a read
+    /// observes this no longer matches today, the count resets to zero.
+    pub star_date: String,
     pub all_view_active: bool,
     pub selected_all_item: usize,
     /// When the detail pane is open, this is the ID of the task being
@@ -681,6 +690,24 @@ fn load_agenda_poll_interval_secs() -> u64 {
     DEFAULT_AGENDA_POLL_INTERVAL_SECS
 }
 
+/// Load today's star jar from disk. Returns `(count, date)` where `date` is
+/// always today's local `YYYY-MM-DD`: if the persisted entry is from a
+/// previous day (or no entry exists), the count is zero and the date is
+/// today. Callers can trust the returned date without re-checking.
+fn load_star_jar() -> (u64, String) {
+    let today = crate::ui::dates::today_str();
+    let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
+    if let Ok(src) = std::fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&src)
+        && let Some(date) = val["star_date"].as_str()
+        && date == today
+        && let Some(count) = val["star_count"].as_u64()
+    {
+        return (count, today);
+    }
+    (0, today)
+}
+
 fn load_idle_timeout_secs() -> u64 {
     let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
     if let Ok(src) = std::fs::read_to_string(&path)
@@ -765,6 +792,8 @@ impl App {
             "github_prs_poll_interval_secs": self.github_prs_poll_interval_secs,
             "jira_cards_poll_interval_secs": self.jira_cards_poll_interval_secs,
             "agenda_poll_interval_secs": self.agenda_poll_interval_secs,
+            "star_count": self.star_count,
+            "star_date": self.star_date,
         });
         let _ = std::fs::write(
             &path,
@@ -789,6 +818,26 @@ impl App {
         }
     }
 
+    /// Roll the star jar forward if the local date has changed since it was
+    /// last observed. Called from any read path (render, increment) so the
+    /// jar resets lazily at midnight without a background timer.
+    fn roll_star_jar_if_new_day(&mut self) {
+        let today = crate::ui::dates::today_str();
+        if self.star_date != today {
+            self.star_date = today;
+            self.star_count = 0;
+        }
+    }
+
+    /// Add one star to today's jar and persist. Rolls the jar first so a
+    /// completion that crosses midnight ticks from zero on the new day,
+    /// not from yesterday's final count.
+    pub fn increment_star_jar(&mut self) {
+        self.roll_star_jar_if_new_day();
+        self.star_count = self.star_count.saturating_add(1);
+        self.save_ui_settings();
+    }
+
     pub fn new(client: TodoistClient, idle_forcer: bool, ephemeral: bool) -> Self {
         let (bg_tx, bg_rx) = mpsc::channel(64);
         let mut themes = crate::ui::theme::Theme::builtin();
@@ -802,6 +851,7 @@ impl App {
             SyncState::load(&config_dir).sync_token
         };
         let idle_timeout_secs = load_idle_timeout_secs();
+        let (star_count, star_date) = load_star_jar();
 
         Self {
             projects: Vec::new(),
@@ -875,6 +925,8 @@ impl App {
             agenda_fetched_at: None,
             selected_agenda_item: 0,
             gws_available: gws_calendar_configured(),
+            star_count,
+            star_date,
             // Start on the All view — it's the primary landing page (first
             // sidebar entry) and surfaces Today's tasks, open PRs, and Jira
             // cards in one place.
@@ -984,6 +1036,10 @@ impl App {
             self.maybe_poll_github_prs();
             self.maybe_poll_jira_cards();
             self.maybe_poll_agenda();
+            // Roll the star jar to zero when the local date has changed
+            // since the last observed count (e.g. app left running past
+            // midnight). Mutates state so render can stay `&App`.
+            self.roll_star_jar_if_new_day();
 
             terminal.draw(|frame| ui::draw(frame, self))?;
 
@@ -2060,6 +2116,14 @@ impl App {
             self.pending_close_recurring.insert(task_id.clone());
         } else if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
             t.checked = !was_checked;
+        }
+
+        // Earn a star for today whenever we're *closing* a task (either
+        // recurring advance or non-recurring complete). Reopens don't
+        // subtract — the jar is a one-way record of effort, per
+        // star-jar.spec.md.
+        if !was_checked {
+            self.increment_star_jar();
         }
 
         // item_close is the command that mirrors the official Todoist UI:
@@ -3774,6 +3838,8 @@ mod tests {
         let mut app = App::new(client, false, true);
         // Isolate tests from on-disk config (e.g. hidden_pr_orgs in ui_settings.json).
         app.hidden_pr_orgs.clear();
+        app.star_count = 0;
+        app.star_date = crate::ui::dates::today_str();
         app
     }
 
@@ -4655,5 +4721,64 @@ mod tests {
 
         assert!(app.tasks[0].checked);
         assert_eq!(pending_cmd_types(&app), vec!["item_close".to_string()]);
+    }
+
+    /// Star jar: each `item_close` earns one star; an `item_reopen` (closing
+    /// an already-checked task) does not subtract; rolling the date
+    /// resets the jar to zero. Covers the one-way-tally contract and the
+    /// lazy midnight rollover described in star-jar.spec.md.
+    #[test]
+    fn star_jar_earns_one_per_completion_and_resets_at_day_rollover() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.tasks.push(Task {
+            id: "t_once".to_string(),
+            content: "Write memo".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: "2026-04-15".to_string(),
+                is_recurring: false,
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.tasks.push(Task {
+            id: "t_recur".to_string(),
+            content: "Standup".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: "2026-04-15".to_string(),
+                is_recurring: true,
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+
+        assert_eq!(app.star_count, 0, "jar starts empty");
+
+        // Non-recurring complete → +1.
+        app.enqueue_complete_task_by_id("t_once".to_string());
+        assert_eq!(app.star_count, 1);
+
+        // Recurring complete also earns a star — it's still work done.
+        app.enqueue_complete_task_by_id("t_recur".to_string());
+        assert_eq!(app.star_count, 2);
+
+        // Reopening the non-recurring task must NOT decrement (and actually
+        // enqueues item_reopen because `checked` is already true).
+        app.enqueue_complete_task_by_id("t_once".to_string());
+        assert_eq!(app.star_count, 2, "reopen does not remove stars");
+
+        // Simulate the local date rolling over; the next completion ticks
+        // from zero on the new day, not from yesterday's final count.
+        app.star_date = "1999-01-01".to_string();
+        app.tasks[0].checked = false;
+        app.enqueue_complete_task_by_id("t_once".to_string());
+        assert_eq!(app.star_count, 1, "jar reset at day rollover");
+        assert_eq!(app.star_date, crate::ui::dates::today_str());
     }
 }

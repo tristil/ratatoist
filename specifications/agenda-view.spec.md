@@ -4,7 +4,7 @@ A virtual sidebar entry below Jira Cards that lists today's events from the user
 
 ## Behavior
 
-- **Only renders in the sidebar if `gws` is on PATH** (detected once at startup via a `gws --version` probe). Users without gws never see the entry.
+- **Only renders in the sidebar if `gws` is configured to read the calendar** (detected once at startup by running `gws auth status` and checking that its JSON output includes `https://www.googleapis.com/auth/calendar` — or the `.readonly` variant — in the `scopes` array). If `gws` is missing from PATH, the command fails, or the calendar scope hasn't been granted, the entry stays hidden. Users who installed `gws` but never ran `gws auth login` (or who granted only non-calendar scopes) don't see a broken Agenda entry that can't fetch.
 - Appears immediately below Jira Cards with a count badge (number of events today).
 - Mutually exclusive with Today, Upcoming, Pull Requests, and Jira Cards.
 - Backed by:

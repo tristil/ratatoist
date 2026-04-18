@@ -36,6 +36,21 @@ says to stop earlier. Don't ask after each step.
 - A pre-existing `clippy::items_after_test_module` warning in `crates/ratatoist-tui/src/ui/dates.rs`
   is known; don't treat it as a blocker for unrelated changes.
 
+## Keep specifications in sync
+
+`specifications/*.spec.md` is the authoritative description of each feature. Any behavior
+change — new feature, new key binding, new filter, new background job, changed default —
+must include a spec update in the same PR:
+
+- **New feature** → new `<feature>.spec.md` modeled on the existing ones (~30–50 lines:
+  Behavior, Display, Actions, Out of Scope).
+- **Changed behavior** → edit the relevant existing spec. The top-level `ratatoist.spec.md`
+  is the front page; the per-view specs (`all-view`, `today-view`, `upcoming-view`,
+  `github-prs-view`, `jira-cards-view`, `agenda-view`, `add-task-modal`, `recurring-complete`)
+  each cover one surface.
+
+If unsure which spec to update, grep `specifications/` for keywords from the change.
+
 ## Edition & syntax
 
 - Workspace is Rust **edition 2024**; let-chains (`if let Some(x) = … && cond`) are in use, prefer them over nested `if let`.

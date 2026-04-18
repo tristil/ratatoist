@@ -2169,7 +2169,16 @@ impl App {
                 .map(|p| p.id.clone())
                 .unwrap_or_default()
         };
-        let (project_id, default_due) = if self.today_view_active {
+        // Mirror the Today-view defaults when the user's cursor is sitting
+        // in the Today section of the All view (i.e. the selected row is a
+        // Task — the only section that holds Tasks). See
+        // `today-view-add.spec.md`.
+        let on_all_view_today_section = self.all_view_active
+            && self
+                .all_view_items()
+                .get(self.selected_all_item)
+                .is_some_and(|i| matches!(i, AllViewItem::Task(_)));
+        let (project_id, default_due) = if self.today_view_active || on_all_view_today_section {
             (inbox_id(), "today")
         } else if self.upcoming_view_active {
             (inbox_id(), "")
@@ -3971,6 +3980,76 @@ mod tests {
         let form = app.task_form.as_ref().expect("form opens");
         assert_eq!(form.due_string, "today", "Due date pre-fills to today");
         assert_eq!(form.project_id, "inbox_1", "Today-view adds go to Inbox");
+    }
+
+    /// Adding from the Today section of the All view mirrors the Today
+    /// view's defaults: due = "today", project = Inbox. Selecting a
+    /// non-Task row (Agenda / PR / Jira) keeps the empty default. Covers
+    /// the All-view branch in start_input — see today-view-add.spec.md.
+    #[test]
+    fn add_from_all_view_today_section_defaults_to_today() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "inbox_1".to_string(),
+            name: "Inbox".to_string(),
+            inbox_project: Some(true),
+            ..Project::default()
+        });
+        app.projects.push(Project {
+            id: "proj_2".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.selected_project = 1;
+        app.tasks.push(Task {
+            id: "t1".to_string(),
+            content: "Plan week".to_string(),
+            project_id: "proj_2".to_string(),
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                is_recurring: false,
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.agenda_events.push(CalendarEvent {
+            summary: "Standup".to_string(),
+            start: "2026-04-18T09:00:00-04:00".to_string(),
+            end: "2026-04-18T09:30:00-04:00".to_string(),
+            all_day: false,
+            location: String::new(),
+            html_link: String::new(),
+            calendar_name: "Work".to_string(),
+        });
+
+        // all_view_items layout is [AgendaEvent(0), Task(0)]. Land the
+        // cursor on the Task row (the Today section).
+        app.all_view_active = true;
+        app.today_view_active = false;
+        app.selected_all_item = 1;
+
+        app.start_input();
+
+        let form = app.task_form.as_ref().expect("form opens");
+        assert_eq!(
+            form.due_string, "today",
+            "All-view Today-section adds default to today"
+        );
+        assert_eq!(
+            form.project_id, "inbox_1",
+            "All-view Today-section adds route to Inbox"
+        );
+
+        // Cursor on the Agenda row should NOT pre-fill — that's the Agenda
+        // section, not Today.
+        app.cancel_input();
+        app.selected_all_item = 0;
+        app.start_input();
+        let form = app.task_form.as_ref().expect("form opens");
+        assert_eq!(
+            form.due_string, "",
+            "All-view Agenda-section adds keep empty due"
+        );
     }
 
     /// Adding from a regular project does NOT pre-fill the due date.

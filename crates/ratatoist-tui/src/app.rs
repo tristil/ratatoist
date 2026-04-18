@@ -350,8 +350,10 @@ fn binary_available(name: &str) -> bool {
 }
 
 /// A pull request row as returned by `gh search prs --json ...`. Subset of the
-/// gh schema — only what we render.
-#[derive(Debug, Clone)]
+/// gh schema — only what we render. `node_id` and `check_status` are
+/// populated by a follow-up GraphQL call after the search; `check_status`
+/// stays `None` if that call fails or if the PR has no checks configured.
+#[derive(Debug, Clone, Default)]
 pub struct PullRequest {
     pub number: u64,
     pub title: String,
@@ -360,6 +362,19 @@ pub struct PullRequest {
     pub author_login: String,
     pub updated_at: String,
     pub is_draft: bool,
+    pub node_id: String,
+    pub check_status: Option<CheckStatus>,
+}
+
+/// CI rollup state for the most recent commit on a PR. Mapped from
+/// GitHub's `statusCheckRollup.state` values (SUCCESS, FAILURE, ERROR,
+/// PENDING, EXPECTED). `Expected` is folded into `Pending` — from the
+/// user's perspective both mean "waiting on a check to report."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    Success,
+    Failure,
+    Pending,
 }
 
 /// A Jira work item as returned by `acli jira workitem search --json`.
@@ -537,7 +552,7 @@ fn load_hidden_pr_orgs() -> HashSet<String> {
 /// Default background poll interval for `gh search prs`. GitHub's search
 /// endpoint rate-limits authenticated users to 30 req/min, so 10 seconds
 /// (6/min) is comfortably under and keeps the PR view near-real-time.
-const DEFAULT_GITHUB_PRS_POLL_INTERVAL_SECS: u64 = 10;
+const DEFAULT_GITHUB_PRS_POLL_INTERVAL_SECS: u64 = 20;
 
 fn load_github_prs_poll_interval_secs() -> u64 {
     let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
@@ -2985,11 +3000,14 @@ fn collect_project_subtree(parent_id: Option<&str>, all: &[Project], out: &mut V
 }
 
 /// Run two `gh search prs` queries in parallel — one for PRs I authored, one
-/// for PRs assigned to me — merge the results, dedup by URL. GitHub search's
-/// flag-based qualifiers are ANDed, so capturing both relationships needs
-/// two calls. Errors from either query are surfaced; partial success (one
-/// query fails, one succeeds) is treated as a failure so the user sees the
-/// problem rather than a silently truncated list.
+/// for PRs assigned to me — merge the results, dedup by URL, then make one
+/// GraphQL call to fold in CI rollup state. GitHub search's flag-based
+/// qualifiers are ANDed, so capturing both relationships needs two calls.
+/// Errors from either search query are surfaced; partial success (one query
+/// fails, one succeeds) is treated as a failure so the user sees the problem
+/// rather than a silently truncated list. The check-status call is
+/// best-effort — if it fails the PRs are still returned with
+/// `check_status: None`.
 async fn fetch_github_prs() -> Result<Vec<PullRequest>> {
     let (authored, assigned) = tokio::try_join!(
         fetch_github_prs_with_flag("--author"),
@@ -3003,7 +3021,100 @@ async fn fetch_github_prs() -> Result<Vec<PullRequest>> {
             merged.push(pr);
         }
     }
+
+    match fetch_pr_check_statuses(&merged).await {
+        Ok(statuses) => {
+            for pr in &mut merged {
+                if let Some(s) = statuses.get(&pr.node_id) {
+                    pr.check_status = Some(*s);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "pr check-status fetch failed; rendering without it");
+        }
+    }
+
     Ok(merged)
+}
+
+/// Batch-fetch `statusCheckRollup.state` for a set of PRs in a single
+/// GraphQL request using aliased `node(id:…)` lookups. Returns a map from
+/// node ID to `CheckStatus`; PRs without rollup state (no checks
+/// configured, or no commits yet) are simply omitted. One API call
+/// regardless of PR count.
+async fn fetch_pr_check_statuses(
+    prs: &[PullRequest],
+) -> Result<std::collections::HashMap<String, CheckStatus>> {
+    use tokio::process::Command;
+
+    let ids: Vec<&str> = prs
+        .iter()
+        .map(|pr| pr.node_id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    // Build `n0: node(id:"..."){...F} n1: node(id:"..."){...F} ...` so we
+    // can correlate each rollup back to its PR by alias index.
+    let mut selections = String::new();
+    for (i, id) in ids.iter().enumerate() {
+        // GitHub node IDs are safe ASCII; still escape quotes defensively.
+        let esc = id.replace('\\', "\\\\").replace('"', "\\\"");
+        selections.push_str(&format!("n{i}: node(id: \"{esc}\") {{ ...S }} "));
+    }
+    let query = format!(
+        "query {{ {selections} }} \
+         fragment S on PullRequest {{ \
+           commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} \
+         }}"
+    );
+
+    let output = Command::new("gh")
+        .args(["api", "graphql", "-f"])
+        .arg(format!("query={query}"))
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to invoke gh api graphql: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow::anyhow!(
+            "gh api graphql exited with status {}: {}",
+            output.status,
+            stderr
+        ));
+    }
+
+    let raw: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("graphql JSON parse error: {e}"))?;
+    let data = &raw["data"];
+
+    let mut out = std::collections::HashMap::new();
+    for (i, id) in ids.iter().enumerate() {
+        let state = data[format!("n{i}")]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+            ["state"]
+            .as_str();
+        if let Some(status) = state.and_then(parse_check_state) {
+            out.insert((*id).to_string(), status);
+        }
+    }
+    Ok(out)
+}
+
+/// Map GitHub's `StatusState` enum string to our collapsed `CheckStatus`.
+/// `EXPECTED` (required check not yet reported) folds into `Pending` — to
+/// the user they're both "waiting."
+fn parse_check_state(s: &str) -> Option<CheckStatus> {
+    match s {
+        "SUCCESS" => Some(CheckStatus::Success),
+        "FAILURE" | "ERROR" => Some(CheckStatus::Failure),
+        "PENDING" | "EXPECTED" => Some(CheckStatus::Pending),
+        _ => None,
+    }
 }
 
 /// Shell out to `gh search prs <flag> @me --state open --json ...` and parse
@@ -3026,7 +3137,7 @@ async fn fetch_github_prs_with_flag(flag: &str) -> Result<Vec<PullRequest>> {
             "--limit",
             "100",
             "--json",
-            "number,title,url,repository,author,updatedAt,isDraft",
+            "id,number,title,url,repository,author,updatedAt,isDraft",
         ])
         .env("GH_NO_UPDATE_NOTIFIER", "1")
         .output()
@@ -3063,6 +3174,8 @@ async fn fetch_github_prs_with_flag(flag: &str) -> Result<Vec<PullRequest>> {
             author_login: item["author"]["login"].as_str().unwrap_or("").to_string(),
             updated_at: item["updatedAt"].as_str().unwrap_or("").to_string(),
             is_draft: item["isDraft"].as_bool().unwrap_or(false),
+            node_id: item["id"].as_str().unwrap_or("").to_string(),
+            check_status: None,
         });
     }
     Ok(prs)
@@ -3730,6 +3843,8 @@ mod tests {
             author_login: "me".into(),
             updated_at: String::new(),
             is_draft: false,
+            node_id: String::new(),
+            check_status: None,
         });
         let entries = app.project_list_entries();
         assert!(
@@ -3785,6 +3900,8 @@ mod tests {
                 author_login: "me".into(),
                 updated_at: String::new(),
                 is_draft: false,
+                node_id: String::new(),
+                check_status: None,
             },
             PullRequest {
                 number: 2,
@@ -3794,6 +3911,8 @@ mod tests {
                 author_login: "me".into(),
                 updated_at: String::new(),
                 is_draft: false,
+                node_id: String::new(),
+                check_status: None,
             },
         ];
 
@@ -3839,6 +3958,8 @@ mod tests {
                 author_login: "me".into(),
                 updated_at: String::new(),
                 is_draft: false,
+                node_id: String::new(),
+                check_status: None,
             },
             PullRequest {
                 number: 2,
@@ -3848,6 +3969,8 @@ mod tests {
                 author_login: "me".into(),
                 updated_at: String::new(),
                 is_draft: false,
+                node_id: String::new(),
+                check_status: None,
             },
             PullRequest {
                 number: 3,
@@ -3857,6 +3980,8 @@ mod tests {
                 author_login: "me".into(),
                 updated_at: String::new(),
                 is_draft: false,
+                node_id: String::new(),
+                check_status: None,
             },
         ];
 
@@ -3882,6 +4007,8 @@ mod tests {
                 author_login: "me".into(),
                 updated_at: String::new(),
                 is_draft: false,
+                node_id: String::new(),
+                check_status: None,
             },
             PullRequest {
                 number: 2,
@@ -3891,6 +4018,8 @@ mod tests {
                 author_login: "me".into(),
                 updated_at: String::new(),
                 is_draft: false,
+                node_id: String::new(),
+                check_status: None,
             },
         ];
         app.activate_github_prs_view("cxrlos".to_string());

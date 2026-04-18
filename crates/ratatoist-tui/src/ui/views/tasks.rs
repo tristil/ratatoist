@@ -188,9 +188,31 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// Render a task's label chips as a sequence of colored spans, matching
+/// the styling used in the Today / project task lists. Returns an empty
+/// vec for checked or unlabeled tasks. Shared with `views::all` so the
+/// All view dashboard surfaces label context the same way.
+pub fn label_spans<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Vec<Span<'a>> {
+    if task.labels.is_empty() || task.checked {
+        return Vec::new();
+    }
+    task.labels
+        .iter()
+        .map(|label_name| {
+            let color = app
+                .labels
+                .iter()
+                .find(|l| &l.name == label_name)
+                .map(|l| theme.color_for(&l.color))
+                .unwrap_or(theme.purple);
+            Span::styled(format!("  {label_name}"), Style::default().fg(color))
+        })
+        .collect()
+}
+
 fn build_task_item<'a>(
     task: &'a Task,
-    app: &App,
+    app: &'a App,
     theme: &Theme,
     show_project: bool,
 ) -> ListItem<'a> {
@@ -237,20 +259,7 @@ fn build_task_item<'a>(
         spans.push(Span::styled(&task.content, theme.normal_text()));
     }
 
-    if !task.labels.is_empty() && !task.checked {
-        for label_name in &task.labels {
-            let color = app
-                .labels
-                .iter()
-                .find(|l| &l.name == label_name)
-                .map(|l| theme.color_for(&l.color))
-                .unwrap_or(theme.purple);
-            spans.push(Span::styled(
-                format!("  {label_name}"),
-                Style::default().fg(color),
-            ));
-        }
-    }
+    spans.extend(label_spans(app, task, theme));
 
     if let Some(count) = task.note_count
         && count > 0

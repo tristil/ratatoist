@@ -576,6 +576,17 @@ pub struct App {
     /// persisted; closing the app abandons the timer. See
     /// [`pomodoro.spec.md`](../../../specifications/pomodoro.spec.md).
     pub pomodoro_started_at: Option<Instant>,
+    /// Stable identifier for the running pomodoro — the RFC 3339
+    /// timestamp of its start. `Some` exactly when `pomodoro_started_at`
+    /// is `Some`. Used both as the event-log `session_id` and as the
+    /// `pomodoro_session_id` stamped onto every `task_complete` event
+    /// that fires while the pomodoro is active, so a future stats view
+    /// can join focus time to the tasks it produced.
+    pub pomodoro_session_id: Option<String>,
+    /// Titles of tasks completed during the current pomodoro, newest
+    /// first. Cleared when the session ends (complete or cancel). Drives
+    /// the rows under the countdown in the toaster.
+    pub pomodoro_session_tasks: Vec<String>,
     /// Count of pomodoros completed today. Incremented by
     /// `maybe_award_tomato` when the running timer reaches 25:00, not
     /// by cancellation. Persisted in `ui_settings.json`; resets lazily
@@ -941,13 +952,32 @@ impl App {
     /// Add one star to today's jar and persist. Rolls the jar first so a
     /// completion that crosses midnight ticks from zero on the new day,
     /// not from yesterday's final count. Also appends a `task_complete`
-    /// line to the events log so a future stats view can trace which
-    /// Todoist task produced the star.
+    /// line to the events log (including `pomodoro_session_id` when a
+    /// pomodoro is active) and pushes the task's title onto the
+    /// session-tasks list so the toaster can render it.
     pub fn increment_star_jar(&mut self, task_id: &str) {
         self.roll_star_jar_if_new_day();
         self.star_count = self.star_count.saturating_add(1);
         self.save_ui_settings();
-        self.append_event("task_complete", serde_json::json!({ "task_id": task_id }));
+
+        let mut extras = serde_json::json!({ "task_id": task_id });
+        if let Some(session_id) = &self.pomodoro_session_id {
+            extras["pomodoro_session_id"] = serde_json::Value::String(session_id.clone());
+            // Snapshot the title now for the toaster; we don't need to
+            // track it live because the task row could change label /
+            // project etc. later — the pomodoro card is about "what
+            // landed during this session" frozen at completion time.
+            let title = self
+                .tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .map(|t| t.content.clone())
+                .unwrap_or_else(|| "(untitled)".to_string());
+            // Newest-first so the most recent completion sits directly
+            // under the countdown.
+            self.pomodoro_session_tasks.insert(0, title);
+        }
+        self.append_event("task_complete", extras);
     }
 
     /// Roll the tomato counter forward on a day change. Analogous to
@@ -964,16 +994,29 @@ impl App {
     /// `p` key binding — start a pomodoro if none is running, cancel the
     /// current one otherwise. Cancellation awards nothing; completion is
     /// driven by `maybe_award_tomato` in the main loop. Each transition
-    /// also appends a line to the events log so cancellation rate and
-    /// start-time histograms are recoverable later. See
-    /// `pomodoro.spec.md` for the full rationale.
+    /// appends a line to the events log carrying the session_id so
+    /// readers can stitch start / complete / cancel into one session.
+    /// See `pomodoro.spec.md` for the full rationale.
     pub fn toggle_pomodoro(&mut self) {
-        if self.pomodoro_started_at.is_some() {
+        if let Some(session_id) = self.pomodoro_session_id.take() {
             self.pomodoro_started_at = None;
-            self.append_event("pomodoro_cancel", serde_json::Value::Null);
+            self.pomodoro_session_tasks.clear();
+            self.append_event(
+                "pomodoro_cancel",
+                serde_json::json!({ "session_id": session_id }),
+            );
         } else {
+            // The session_id is the RFC 3339 of start — stable, already
+            // monotonic, and doubles as the join key on task_complete
+            // events stamped during the session.
+            let session_id = chrono::Local::now().to_rfc3339();
             self.pomodoro_started_at = Some(Instant::now());
-            self.append_event("pomodoro_start", serde_json::Value::Null);
+            self.pomodoro_session_id = Some(session_id.clone());
+            self.pomodoro_session_tasks.clear();
+            self.append_event(
+                "pomodoro_start",
+                serde_json::json!({ "session_id": session_id }),
+            );
         }
     }
 
@@ -996,11 +1039,17 @@ impl App {
         if start.elapsed() < POMODORO_DURATION {
             return;
         }
+        let session_id = self.pomodoro_session_id.take();
         self.pomodoro_started_at = None;
+        self.pomodoro_session_tasks.clear();
         self.roll_tomato_jar_if_new_day();
         self.tomato_count = self.tomato_count.saturating_add(1);
         self.save_ui_settings();
-        self.append_event("pomodoro_complete", serde_json::Value::Null);
+        let extras = match session_id {
+            Some(id) => serde_json::json!({ "session_id": id }),
+            None => serde_json::Value::Null,
+        };
+        self.append_event("pomodoro_complete", extras);
     }
 
     pub fn new(client: TodoistClient, idle_forcer: bool, ephemeral: bool) -> Self {
@@ -1096,6 +1145,8 @@ impl App {
             star_count,
             star_date,
             pomodoro_started_at: None,
+            pomodoro_session_id: None,
+            pomodoro_session_tasks: Vec::new(),
             tomato_count,
             tomato_date,
             // Start on the All view — it's the primary landing page (first
@@ -5080,17 +5131,22 @@ mod tests {
         assert_eq!(app.star_date, crate::ui::dates::today_str());
     }
 
-    /// `p` toggles the pomodoro: start sets `pomodoro_started_at`,
-    /// second press clears it without incrementing tomatoes. Cancellation
-    /// throws away the elapsed time per spec.
+    /// `p` toggles the pomodoro: start sets `pomodoro_started_at` and a
+    /// `pomodoro_session_id`; second press clears both without incrementing
+    /// tomatoes. Cancellation throws away the elapsed time per spec.
     #[test]
     fn toggle_pomodoro_starts_and_cancels() {
         let mut app = test_app();
         app.tomato_count = 0;
         assert!(app.pomodoro_started_at.is_none(), "starts idle");
+        assert!(app.pomodoro_session_id.is_none());
 
         app.toggle_pomodoro();
         assert!(app.pomodoro_started_at.is_some(), "p starts a pomodoro");
+        assert!(
+            app.pomodoro_session_id.is_some(),
+            "session_id populated on start"
+        );
         assert_eq!(app.tomato_count, 0, "start doesn't award a tomato");
 
         app.toggle_pomodoro();
@@ -5098,7 +5154,74 @@ mod tests {
             app.pomodoro_started_at.is_none(),
             "second p cancels the pomodoro"
         );
+        assert!(
+            app.pomodoro_session_id.is_none(),
+            "session_id cleared on cancel"
+        );
+        assert!(
+            app.pomodoro_session_tasks.is_empty(),
+            "session_tasks cleared on cancel"
+        );
         assert_eq!(app.tomato_count, 0, "cancel doesn't award a tomato");
+    }
+
+    /// Completing a task while a pomodoro is running should push the
+    /// task's title onto `pomodoro_session_tasks` (newest first) and
+    /// the task_complete event that gets appended must carry the
+    /// running session's id under `pomodoro_session_id`. Completing
+    /// outside a pomodoro leaves the list alone.
+    #[test]
+    fn completing_task_during_pomodoro_tracks_session() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.tasks.push(Task {
+            id: "t_a".to_string(),
+            content: "Write memo".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                is_recurring: false,
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.tasks.push(Task {
+            id: "t_b".to_string(),
+            content: "Review PR".to_string(),
+            project_id: "p1".to_string(),
+            ..Task::default()
+        });
+
+        // No pomodoro yet → session_tasks stays empty after completion.
+        app.enqueue_complete_task_by_id("t_a".to_string());
+        assert!(app.pomodoro_session_tasks.is_empty());
+
+        // Start a pomodoro and complete another task — it should land in
+        // the toaster list at position 0.
+        app.toggle_pomodoro();
+        let session_id = app.pomodoro_session_id.clone();
+        assert!(session_id.is_some());
+        app.tasks[1].checked = false;
+        app.enqueue_complete_task_by_id("t_b".to_string());
+        assert_eq!(app.pomodoro_session_tasks, vec!["Review PR".to_string()]);
+
+        // A second completion during the same pomodoro goes to the
+        // front, preserving newest-first ordering.
+        app.tasks[0].checked = false;
+        app.enqueue_complete_task_by_id("t_a".to_string());
+        assert_eq!(
+            app.pomodoro_session_tasks,
+            vec!["Write memo".to_string(), "Review PR".to_string()]
+        );
+
+        // Cancelling the pomodoro clears the list and the session id.
+        app.toggle_pomodoro();
+        assert!(app.pomodoro_session_id.is_none());
+        assert!(app.pomodoro_session_tasks.is_empty());
     }
 
     /// When the full POMODORO_DURATION has elapsed, `maybe_award_tomato`
@@ -5132,6 +5255,14 @@ mod tests {
         assert!(
             app.pomodoro_started_at.is_none(),
             "completion clears running state"
+        );
+        assert!(
+            app.pomodoro_session_id.is_none(),
+            "completion clears session id"
+        );
+        assert!(
+            app.pomodoro_session_tasks.is_empty(),
+            "completion clears session tasks"
         );
 
         // A second elapsed pomodoro on a different date resets first.

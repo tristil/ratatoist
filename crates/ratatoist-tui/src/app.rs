@@ -571,6 +571,19 @@ pub struct App {
     /// Persisted in `ui_settings.json` alongside `star_date`; see
     /// [`star-jar.spec.md`](../../../specifications/star-jar.spec.md).
     pub star_count: u64,
+    /// Wall-clock instant the current 25-minute pomodoro began, or `None`
+    /// when no pomodoro is running. Session-scoped — deliberately NOT
+    /// persisted; closing the app abandons the timer. See
+    /// [`pomodoro.spec.md`](../../../specifications/pomodoro.spec.md).
+    pub pomodoro_started_at: Option<Instant>,
+    /// Count of pomodoros completed today. Incremented by
+    /// `maybe_award_tomato` when the running timer reaches 25:00, not
+    /// by cancellation. Persisted in `ui_settings.json`; resets lazily
+    /// at local midnight (same pattern as the Star Jar).
+    pub tomato_count: u64,
+    /// Local date (YYYY-MM-DD) of the stored `tomato_count`. When a read
+    /// observes this no longer matches today, the count resets to zero.
+    pub tomato_date: String,
     /// Local date (YYYY-MM-DD) of the stored `star_count`. When a read
     /// observes this no longer matches today, the count resets to zero.
     pub star_date: String,
@@ -710,6 +723,26 @@ fn load_show_stats() -> bool {
     false
 }
 
+/// Length of a single pomodoro. Fixed; see `pomodoro.spec.md`.
+pub const POMODORO_DURATION: Duration = Duration::from_secs(25 * 60);
+
+/// Load today's tomato counter from disk. Mirrors `load_star_jar` —
+/// returns `(count, today)` with the count zeroed when the persisted date
+/// doesn't match today's local date, so callers never see stale values.
+fn load_tomato_jar() -> (u64, String) {
+    let today = crate::ui::dates::today_str();
+    let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
+    if let Ok(src) = std::fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&src)
+        && let Some(date) = val["tomato_date"].as_str()
+        && date == today
+        && let Some(count) = val["tomato_count"].as_u64()
+    {
+        return (count, today);
+    }
+    (0, today)
+}
+
 /// Load today's star jar from disk. Returns `(count, date)` where `date` is
 /// always today's local `YYYY-MM-DD`: if the persisted entry is from a
 /// previous day (or no entry exists), the count is zero and the date is
@@ -815,6 +848,8 @@ impl App {
             "show_stats": self.show_stats,
             "star_count": self.star_count,
             "star_date": self.star_date,
+            "tomato_count": self.tomato_count,
+            "tomato_date": self.tomato_date,
         });
         let _ = std::fs::write(
             &path,
@@ -859,6 +894,54 @@ impl App {
         self.save_ui_settings();
     }
 
+    /// Roll the tomato counter forward on a day change. Analogous to
+    /// `roll_star_jar_if_new_day` — read on every render tick so the box
+    /// empties lazily at local midnight without a background timer.
+    fn roll_tomato_jar_if_new_day(&mut self) {
+        let today = crate::ui::dates::today_str();
+        if self.tomato_date != today {
+            self.tomato_date = today;
+            self.tomato_count = 0;
+        }
+    }
+
+    /// `p` key binding — start a pomodoro if none is running, cancel the
+    /// current one otherwise. Cancellation awards nothing; completion is
+    /// driven by `maybe_award_tomato` in the main loop. See
+    /// `pomodoro.spec.md` for the full rationale.
+    pub fn toggle_pomodoro(&mut self) {
+        if self.pomodoro_started_at.is_some() {
+            self.pomodoro_started_at = None;
+        } else {
+            self.pomodoro_started_at = Some(Instant::now());
+        }
+    }
+
+    /// Remaining time on the active pomodoro, or `None` when no pomodoro
+    /// is running. Clamps to zero once the full duration has elapsed so
+    /// the status-bar countdown holds at `00:00` for the frame between
+    /// elapse and `maybe_award_tomato` clearing the state.
+    pub fn pomodoro_remaining(&self) -> Option<Duration> {
+        let start = self.pomodoro_started_at?;
+        Some(POMODORO_DURATION.saturating_sub(start.elapsed()))
+    }
+
+    /// If a pomodoro has fully elapsed, increment the tomato count and
+    /// clear the running state. Called every main-loop tick; cheap (a
+    /// couple of compares in the common no-op case).
+    pub fn maybe_award_tomato(&mut self) {
+        let Some(start) = self.pomodoro_started_at else {
+            return;
+        };
+        if start.elapsed() < POMODORO_DURATION {
+            return;
+        }
+        self.pomodoro_started_at = None;
+        self.roll_tomato_jar_if_new_day();
+        self.tomato_count = self.tomato_count.saturating_add(1);
+        self.save_ui_settings();
+    }
+
     pub fn new(client: TodoistClient, idle_forcer: bool, ephemeral: bool) -> Self {
         let (bg_tx, bg_rx) = mpsc::channel(64);
         let mut themes = crate::ui::theme::Theme::builtin();
@@ -873,6 +956,7 @@ impl App {
         };
         let idle_timeout_secs = load_idle_timeout_secs();
         let (star_count, star_date) = load_star_jar();
+        let (tomato_count, tomato_date) = load_tomato_jar();
         let show_stats = load_show_stats();
 
         Self {
@@ -950,6 +1034,9 @@ impl App {
             show_stats,
             star_count,
             star_date,
+            pomodoro_started_at: None,
+            tomato_count,
+            tomato_date,
             // Start on the All view — it's the primary landing page (first
             // sidebar entry) and surfaces Today's tasks, open PRs, and Jira
             // cards in one place.
@@ -1063,6 +1150,10 @@ impl App {
             // since the last observed count (e.g. app left running past
             // midnight). Mutates state so render can stay `&App`.
             self.roll_star_jar_if_new_day();
+            self.roll_tomato_jar_if_new_day();
+            // Completion check for the active pomodoro, if any — cheap
+            // enough to run every frame.
+            self.maybe_award_tomato();
 
             terminal.draw(|frame| ui::draw(frame, self))?;
 
@@ -1117,6 +1208,7 @@ impl App {
                         self.open_selected_event_in_browser()
                     }
                     KeyAction::ToggleOverdueSection => self.toggle_overdue_section(),
+                    KeyAction::TogglePomodoro => self.toggle_pomodoro(),
                     KeyAction::OpenDetail => self.open_detail(),
                     KeyAction::CloseDetail => {
                         self.active_pane = Pane::Tasks;
@@ -3880,6 +3972,9 @@ mod tests {
         app.hidden_pr_orgs.clear();
         app.star_count = 0;
         app.star_date = crate::ui::dates::today_str();
+        app.tomato_count = 0;
+        app.tomato_date = crate::ui::dates::today_str();
+        app.pomodoro_started_at = None;
         app
     }
 
@@ -3897,6 +3992,7 @@ mod tests {
             KeyAction::CancelInput => app.cancel_input(),
             KeyAction::CompleteTaskById(id) => app.complete_task_by_id(id),
             KeyAction::OpenDetailById(id) => app.open_detail_for(id),
+            KeyAction::TogglePomodoro => app.toggle_pomodoro(),
             KeyAction::Consumed | KeyAction::None => {}
             _ => panic!("unexpected key action in test"),
         }
@@ -4921,5 +5017,71 @@ mod tests {
         app.enqueue_complete_task_by_id("t_once".to_string());
         assert_eq!(app.star_count, 1, "jar reset at day rollover");
         assert_eq!(app.star_date, crate::ui::dates::today_str());
+    }
+
+    /// `p` toggles the pomodoro: start sets `pomodoro_started_at`,
+    /// second press clears it without incrementing tomatoes. Cancellation
+    /// throws away the elapsed time per spec.
+    #[test]
+    fn toggle_pomodoro_starts_and_cancels() {
+        let mut app = test_app();
+        app.tomato_count = 0;
+        assert!(app.pomodoro_started_at.is_none(), "starts idle");
+
+        app.toggle_pomodoro();
+        assert!(app.pomodoro_started_at.is_some(), "p starts a pomodoro");
+        assert_eq!(app.tomato_count, 0, "start doesn't award a tomato");
+
+        app.toggle_pomodoro();
+        assert!(
+            app.pomodoro_started_at.is_none(),
+            "second p cancels the pomodoro"
+        );
+        assert_eq!(app.tomato_count, 0, "cancel doesn't award a tomato");
+    }
+
+    /// When the full POMODORO_DURATION has elapsed, `maybe_award_tomato`
+    /// increments the count and clears the running state. Simulated by
+    /// backdating `pomodoro_started_at` so the test runs instantly.
+    /// Tomato reset at day rollover is also verified here.
+    #[test]
+    fn maybe_award_tomato_credits_and_resets_at_rollover() {
+        let mut app = test_app();
+        app.tomato_count = 0;
+        app.tomato_date = crate::ui::dates::today_str();
+
+        // No pomodoro → no-op.
+        app.maybe_award_tomato();
+        assert_eq!(app.tomato_count, 0);
+
+        // Running but not yet elapsed → no-op.
+        app.toggle_pomodoro();
+        app.maybe_award_tomato();
+        assert_eq!(app.tomato_count, 0, "mid-timer awards nothing");
+        assert!(app.pomodoro_started_at.is_some());
+
+        // Backdate the start so the timer has fully elapsed.
+        app.pomodoro_started_at = Some(
+            Instant::now()
+                .checked_sub(POMODORO_DURATION)
+                .expect("Instant should subtract"),
+        );
+        app.maybe_award_tomato();
+        assert_eq!(app.tomato_count, 1, "completion awards a tomato");
+        assert!(
+            app.pomodoro_started_at.is_none(),
+            "completion clears running state"
+        );
+
+        // A second elapsed pomodoro on a different date resets first.
+        app.tomato_date = "1999-01-01".to_string();
+        app.pomodoro_started_at = Some(
+            Instant::now()
+                .checked_sub(POMODORO_DURATION)
+                .expect("Instant should subtract"),
+        );
+        app.maybe_award_tomato();
+        assert_eq!(app.tomato_count, 1, "rollover zeroed then incremented");
+        assert_eq!(app.tomato_date, crate::ui::dates::today_str());
     }
 }

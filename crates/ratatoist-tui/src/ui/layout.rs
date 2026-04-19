@@ -7,6 +7,9 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use crate::app::{App, DOCK_ITEMS, DockItem, Pane, SortMode, TaskFilter};
 
 const STATS_HEIGHT: u16 = 4;
+/// Pomodoro box reserved height (top border + 1 body line + bottom
+/// border). Does not grow — see `pomodoro.spec.md`.
+const POMODORO_HEIGHT: u16 = 3;
 /// Each rendered star takes one glyph + one separator space. Used to
 /// compute how many stars fit on a sidebar row before wrapping.
 const STAR_CELL_WIDTH: u16 = 2;
@@ -112,9 +115,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     // go to the project list (and, if the jar needs to grow, to the jar).
     let stats_rows: u16 = if app.show_stats { STATS_HEIGHT } else { 0 };
     let settings_rows: u16 = if app.show_settings { 5 } else { 0 };
+    // Pomodoro box always renders at its fixed height, directly above
+    // the Star Jar. Its rows come out of the project list's budget
+    // alongside Stats and Settings.
     let max_body = left_area
         .height
         .saturating_sub(stats_rows)
+        .saturating_sub(POMODORO_HEIGHT)
         .saturating_sub(STAR_JAR_BORDER_ROWS)
         .saturating_sub(settings_rows)
         .saturating_sub(STAR_JAR_PROJECT_FLOOR)
@@ -125,11 +132,12 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Build the left-column constraints dynamically: the Stats and
     // Settings slots are elided entirely when their feature flag is off,
     // so the corresponding pane can never capture focus of a block that
-    // isn't on screen.
+    // isn't on screen. The Pomodoro box is always present.
     let mut constraints: Vec<Constraint> = vec![Constraint::Min(1)];
     if app.show_stats {
         constraints.push(Constraint::Length(STATS_HEIGHT));
     }
+    constraints.push(Constraint::Length(POMODORO_HEIGHT));
     constraints.push(Constraint::Length(jar_height));
     if app.show_settings {
         constraints.push(Constraint::Length(settings_rows));
@@ -145,6 +153,8 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else {
         None
     };
+    let pomodoro_area = areas[idx];
+    idx += 1;
     let star_area = areas[idx];
     idx += 1;
     let settings_area = if app.show_settings {
@@ -157,6 +167,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let Some(stats_area) = stats_area {
         render_stats_block(frame, app, stats_area, stats_active);
     }
+    render_pomodoro_block(frame, app, pomodoro_area);
     render_star_jar_block(frame, app, star_area, &plan);
     if let Some(settings_area) = settings_area {
         views::settings::render(frame, app, settings_area, settings_active);
@@ -368,6 +379,38 @@ fn render_filter_row(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Passive counter block just above the Star Jar. One 🍅 per completed
+/// pomodoro today; `—` when empty. Fixed 3-row height regardless of
+/// count — overflow clips per the spec. See
+/// [`pomodoro.spec.md`](../../../specifications/pomodoro.spec.md).
+fn render_pomodoro_block(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let block = Block::default()
+        .title(" Pomodoros ")
+        .title_style(theme.title())
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(theme.inactive_border())
+        .padding(Padding::horizontal(1))
+        .style(theme.base_bg());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let line = if app.tomato_count == 0 {
+        Line::from(Span::styled("—", theme.muted_text()))
+    } else {
+        let mut spans: Vec<Span> = Vec::with_capacity(app.tomato_count as usize * 2);
+        for i in 0..app.tomato_count {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::raw("🍅"));
+        }
+        Line::from(spans)
+    };
+    frame.render_widget(Paragraph::new(line), inner);
 }
 
 /// Passive counter block at the bottom of the left sidebar. One yellow

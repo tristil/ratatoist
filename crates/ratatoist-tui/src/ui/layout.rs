@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use crate::app::{App, DOCK_ITEMS, DockItem, Pane, SortMode, TaskFilter};
 
@@ -194,6 +194,11 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_tasks_block(frame, app, right_area, tasks_active);
     }
 
+    // Toaster floats over the bottom-right of the right-hand pane. Last
+    // in render order so it overlays whatever's below it. Invisible
+    // when no pomodoro is running — see `pomodoro.spec.md`.
+    render_pomodoro_toaster(frame, app, right_area);
+
     statusbar::render(frame, app, status_area);
     keyhints::render(frame, app, hints_area);
 }
@@ -379,6 +384,91 @@ fn render_filter_row(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Preferred toaster width (outer, including borders). Clamped down
+/// when the right pane is narrower than this.
+const TOASTER_WIDTH: u16 = 40;
+
+/// Truncate a task title to fit the toaster's inner width, appending
+/// `…` when characters had to drop. Operates on `chars` so multi-byte
+/// content (emoji, accents) doesn't produce a panic-y byte boundary.
+fn truncate_for_toaster(title: &str, inner_width: u16) -> String {
+    let width = inner_width as usize;
+    let char_count = title.chars().count();
+    if char_count <= width {
+        return title.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = title.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Floating "toaster" block rendered in the bottom-right of the right
+/// pane while a pomodoro is running. Top row is the MM:SS countdown;
+/// subsequent rows list titles of tasks completed during the session,
+/// newest first. Width is `TOASTER_WIDTH` clamped to `right_area.width`;
+/// height is `1 (countdown) + tasks.len() + 2 (borders)`, clamped so
+/// the toaster never exceeds the pane. Vanishes when no pomodoro runs.
+/// See [`pomodoro.spec.md`](../../../specifications/pomodoro.spec.md).
+fn render_pomodoro_toaster(frame: &mut Frame, app: &App, pane: Rect) {
+    let Some(remaining) = app.pomodoro_remaining() else {
+        return;
+    };
+    if pane.width < 6 || pane.height < 3 {
+        return;
+    }
+
+    let theme = app.theme();
+    let width = TOASTER_WIDTH.min(pane.width);
+    let task_rows = app.pomodoro_session_tasks.len() as u16;
+    let desired_height = 1u16.saturating_add(task_rows).saturating_add(2);
+    let height = desired_height.min(pane.height);
+    // Anchor to the bottom-right of the pane.
+    let x = pane.x.saturating_add(pane.width.saturating_sub(width));
+    let y = pane.y.saturating_add(pane.height.saturating_sub(height));
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    // Clear whatever's behind the toaster so rendered borders don't
+    // composite over the tasks list.
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" 🍅 session ")
+        .title_style(theme.title())
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(theme.inactive_border())
+        .padding(Padding::horizontal(1))
+        .style(theme.base_bg());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let total = remaining.as_secs();
+    let countdown = format!("🍅 {:02}:{:02}", total / 60, total % 60);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(1 + app.pomodoro_session_tasks.len());
+    lines.push(Line::from(Span::styled(countdown, theme.due_today())));
+    // Inner width minus the `✓ ` prefix (two cells).
+    let title_width = inner.width.saturating_sub(2);
+    for title in &app.pomodoro_session_tasks {
+        lines.push(Line::from(vec![
+            Span::styled("✓ ", theme.success()),
+            Span::styled(
+                truncate_for_toaster(title, title_width),
+                theme.normal_text(),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Passive counter block just above the Star Jar. One 🍅 per completed
@@ -593,5 +683,17 @@ mod tests {
         assert_eq!(plan.body_rows, 1);
         assert_eq!(plan.rows.len(), 1);
         assert!(plan.rows[0].is_empty());
+    }
+
+    #[test]
+    fn truncate_for_toaster_shortens_with_ellipsis() {
+        assert_eq!(truncate_for_toaster("short", 30), "short");
+        assert_eq!(
+            truncate_for_toaster("this title is too long to fit", 10),
+            "this titl…"
+        );
+        // Degenerate widths don't panic.
+        assert_eq!(truncate_for_toaster("anything", 1), "…");
+        assert_eq!(truncate_for_toaster("anything", 0), "…");
     }
 }

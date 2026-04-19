@@ -19,11 +19,15 @@ A single-slot 25-minute pomodoro timer paired with a tomato counter. Hitting `p`
 
 ## Display
 
-### Countdown (status bar)
+### Session toaster (bottom-right of right pane)
 
-- While a pomodoro is running, the status bar renders `🍅 MM:SS` on its right side, just before the websocket-connection indicator. Uses the theme's `due_today()` style so it feels active without being alarming.
-- Format: two-digit minutes and seconds (`24:59`, `00:03`, `00:00`). Collapses to nothing the instant the timer clears.
-- When no pomodoro is running, the countdown segment simply isn't rendered and the rest of the status bar shifts right to fill.
+- While a pomodoro is running, a bordered "toaster" block floats in the **bottom-right corner of the right-hand content area** (overlapping the tasks / detail pane without resizing it). Styled like the sidebar blocks — rounded borders, inactive-border color, title ` 🍅 session `.
+- **Top body row: the countdown.** `🍅 24:59` — two-digit minutes and seconds, styled with the theme's `due_today()` so it reads as active. The countdown lives here; nothing in the status bar.
+- **Body rows below: tasks completed during this session**, most-recent-first, one title per row. Each row is prefixed with `✓ ` in the success style. Titles are truncated to the toaster's inner width with a trailing `…` so the block never outruns its width.
+- **The toaster grows downward (and the top stays anchored)** as tasks land: height is `1 (countdown) + N (tasks) + 2 (borders)`. Width is fixed at 40 columns unless the right-hand area is narrower, in which case the toaster uses whatever room is available.
+- **Vanishes immediately** when the session ends — whether the timer elapsed naturally *or* the user hit `p` to cancel. There's no linger / celebration delay; the tomato lands in the sidebar box and the toaster disappears on the same frame.
+- No focus, no keybinding. The toaster is read-only — purely a status surface.
+- Task scope: **every completion that happens while the pomodoro is running** (any view — project, Today, All, doesn't matter) is associated with the session. If you complete 12 tasks in 25 minutes, 12 of them appear in the toaster (truncated to what fits on screen).
 
 ### Pomodoro box (left sidebar)
 
@@ -37,7 +41,8 @@ A single-slot 25-minute pomodoro timer paired with a tomato counter. Hitting `p`
 - `tomato_count: u64` and `tomato_date: YYYY-MM-DD` are stored in `ui_settings.json`, next to the Star Jar's keys.
 - The running-state (`pomodoro_started_at`) is deliberately not persisted. Session-scoped only.
 - `pomodoro_running` / `pomodoro_remaining_secs` are derived from the `Instant` at render time; no need to write either to disk.
-- **Every pomodoro start / complete / cancel also appends a timestamped line to the events log** (see [events-log.spec.md](events-log.spec.md)) — `{"ts": "...", "kind": "pomodoro_start" | "pomodoro_complete" | "pomodoro_cancel"}`. The running count for today is still the in-memory `tomato_count`; the log is for cross-day retrospective stats (cancellation rate, time-of-day patterns, weekly totals).
+- **Every pomodoro start / complete / cancel also appends a timestamped line to the events log** (see [events-log.spec.md](events-log.spec.md)). Each of those three lines carries a `session_id` — the RFC 3339 timestamp of the pomodoro's start, used as a stable session identifier. The running count for today is still the in-memory `tomato_count`; the log is for cross-day retrospective stats (cancellation rate, time-of-day patterns, weekly totals).
+- **Task completions during the session carry the same `session_id`** on their `task_complete` event (under the key `pomodoro_session_id`). This is how the pomodoro→tasks association is persisted: a future stats reader joins `task_complete` records to their parent pomodoro by matching `pomodoro_session_id` against the `session_id` on a `pomodoro_start`/`pomodoro_complete` pair. Completions outside a pomodoro simply don't carry the field.
 
 ## Out of Scope (v1)
 

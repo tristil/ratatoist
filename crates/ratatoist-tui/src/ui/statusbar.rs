@@ -51,31 +51,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let status_str = format!("{ws_label} {ws_dot} ");
     let status_width = status_str.chars().count() as u16;
 
-    // Pomodoro countdown lives between the breadcrumb and the
-    // connection indicator. `🍅 MM:SS ` — the trailing space gives it
-    // breathing room from the websocket dot. Absent entirely when no
-    // pomodoro is running.
-    let pomo_str = app
-        .pomodoro_remaining()
-        .map(|remaining| {
-            let total = remaining.as_secs();
-            format!("🍅 {:02}:{:02} ", total / 60, total % 60)
-        })
-        .unwrap_or_default();
-    // `🍅` is two cells wide in every terminal we care about, so count
-    // chars but add one for the emoji's second cell.
-    let pomo_width = if pomo_str.is_empty() {
-        0
-    } else {
-        pomo_str.chars().count() as u16 + 1
-    };
-
-    let [left, middle, right] = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(pomo_width),
-        Constraint::Length(status_width),
-    ])
-    .areas(area);
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width)]).areas(area);
 
     let spans = vec![
         Span::styled(mode_label, mode_style),
@@ -86,13 +63,6 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(spans)).style(theme.surface_bg()),
         left,
     );
-    if !pomo_str.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(pomo_str, theme.due_today())))
-                .style(theme.surface_bg()),
-            middle,
-        );
-    }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(ws_label, theme.muted_text()),

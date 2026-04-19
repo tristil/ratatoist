@@ -9,6 +9,7 @@ A passive counter in the left sidebar that earns a star every time the user comp
 - The jar resets when the local date rolls over. Detection is lazy: on any read (render, increment, load) the stored `star_date` is compared against today's local date; if they differ, the count is replaced with zero and the date updated.
 - Count and date persist in `ui_settings.json` under `star_count` and `star_date` (ISO `YYYY-MM-DD`). Survives app restart — close and reopen within the same day and the jar keeps its count.
 - Ephemeral mode (the `--ephemeral` harness used in tests and throwaway sessions) skips the save, like every other ui_settings write.
+- **Every star also appends a timestamped line to the events log** (see [events-log.spec.md](events-log.spec.md)) — `{"ts": "...", "kind": "task_complete", "task_id": "<todoist task id>"}`. The current day's jar is still derived from `star_count` for rendering speed; the log is the durable record for future retrospective stats.
 
 ## Display
 

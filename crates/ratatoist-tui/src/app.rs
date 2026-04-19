@@ -726,6 +726,30 @@ fn load_show_stats() -> bool {
 /// Length of a single pomodoro. Fixed; see `pomodoro.spec.md`.
 pub const POMODORO_DURATION: Duration = Duration::from_secs(25 * 60);
 
+/// Build a single event-log line (JSON + trailing newline). Pure —
+/// separated from the file write so tests can verify the on-disk shape
+/// without touching the filesystem. `extras` is spread into the record
+/// alongside the mandatory `ts` and `kind`; pass `serde_json::Value::Null`
+/// when the event has no extra fields. See `events-log.spec.md`.
+fn build_event_line(
+    kind: &str,
+    now: chrono::DateTime<chrono::Local>,
+    extras: serde_json::Value,
+) -> String {
+    let mut obj = serde_json::json!({
+        "ts": now.to_rfc3339(),
+        "kind": kind,
+    });
+    if let Some(map) = extras.as_object() {
+        for (k, v) in map {
+            obj[k] = v.clone();
+        }
+    }
+    let mut line = obj.to_string();
+    line.push('\n');
+    line
+}
+
 /// Load today's tomato counter from disk. Mirrors `load_star_jar` —
 /// returns `(count, today)` with the count zeroed when the persisted date
 /// doesn't match today's local date, so callers never see stale values.
@@ -885,13 +909,45 @@ impl App {
         }
     }
 
+    /// Append one record to the events log (`events.jsonl` next to
+    /// `ui_settings.json`). No-op in ephemeral mode. Write failures are
+    /// logged and swallowed — the log is nice-to-have, not critical
+    /// state. See `events-log.spec.md`.
+    fn append_event(&self, kind: &str, extras: serde_json::Value) {
+        if self.ephemeral {
+            return;
+        }
+        let line = build_event_line(kind, chrono::Local::now(), extras);
+        let dir = ratatoist_core::config::Config::config_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("events.jsonl");
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(line.as_bytes()) {
+                    tracing::warn!(error = %e, path = %path.display(), "events log write failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "events log open failed");
+            }
+        }
+    }
+
     /// Add one star to today's jar and persist. Rolls the jar first so a
     /// completion that crosses midnight ticks from zero on the new day,
-    /// not from yesterday's final count.
-    pub fn increment_star_jar(&mut self) {
+    /// not from yesterday's final count. Also appends a `task_complete`
+    /// line to the events log so a future stats view can trace which
+    /// Todoist task produced the star.
+    pub fn increment_star_jar(&mut self, task_id: &str) {
         self.roll_star_jar_if_new_day();
         self.star_count = self.star_count.saturating_add(1);
         self.save_ui_settings();
+        self.append_event("task_complete", serde_json::json!({ "task_id": task_id }));
     }
 
     /// Roll the tomato counter forward on a day change. Analogous to
@@ -907,13 +963,17 @@ impl App {
 
     /// `p` key binding — start a pomodoro if none is running, cancel the
     /// current one otherwise. Cancellation awards nothing; completion is
-    /// driven by `maybe_award_tomato` in the main loop. See
+    /// driven by `maybe_award_tomato` in the main loop. Each transition
+    /// also appends a line to the events log so cancellation rate and
+    /// start-time histograms are recoverable later. See
     /// `pomodoro.spec.md` for the full rationale.
     pub fn toggle_pomodoro(&mut self) {
         if self.pomodoro_started_at.is_some() {
             self.pomodoro_started_at = None;
+            self.append_event("pomodoro_cancel", serde_json::Value::Null);
         } else {
             self.pomodoro_started_at = Some(Instant::now());
+            self.append_event("pomodoro_start", serde_json::Value::Null);
         }
     }
 
@@ -940,6 +1000,7 @@ impl App {
         self.roll_tomato_jar_if_new_day();
         self.tomato_count = self.tomato_count.saturating_add(1);
         self.save_ui_settings();
+        self.append_event("pomodoro_complete", serde_json::Value::Null);
     }
 
     pub fn new(client: TodoistClient, idle_forcer: bool, ephemeral: bool) -> Self {
@@ -2242,7 +2303,7 @@ impl App {
         // subtract — the jar is a one-way record of effort, per
         // star-jar.spec.md.
         if !was_checked {
-            self.increment_star_jar();
+            self.increment_star_jar(&task_id);
         }
 
         // item_close is the command that mirrors the official Todoist UI:
@@ -5083,5 +5144,44 @@ mod tests {
         app.maybe_award_tomato();
         assert_eq!(app.tomato_count, 1, "rollover zeroed then incremented");
         assert_eq!(app.tomato_date, crate::ui::dates::today_str());
+    }
+
+    /// Locks in the on-disk shape of the events log. Readers (a future
+    /// stats view) should be able to depend on: `ts` as RFC 3339,
+    /// `kind` as a stable string, extras spread into the top-level
+    /// object, and one record per line with a trailing newline.
+    #[test]
+    fn event_line_contains_ts_kind_and_extras_and_newline() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 4, 18, 14, 32, 17)
+            .single()
+            .expect("valid local time");
+
+        let star_line = build_event_line(
+            "task_complete",
+            now,
+            serde_json::json!({ "task_id": "abc123" }),
+        );
+        assert!(star_line.ends_with('\n'), "one record per line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(star_line.trim_end()).expect("valid JSON");
+        assert_eq!(parsed["kind"], "task_complete");
+        assert_eq!(parsed["task_id"], "abc123");
+        assert!(
+            parsed["ts"]
+                .as_str()
+                .expect("ts is a string")
+                .contains("2026-04-18T14:32:17")
+        );
+
+        // Null extras produce no extra fields beyond ts + kind.
+        let pomo_line =
+            build_event_line("pomodoro_start", now, serde_json::Value::Null);
+        let parsed: serde_json::Value =
+            serde_json::from_str(pomo_line.trim_end()).expect("valid JSON");
+        let obj = parsed.as_object().expect("object");
+        assert_eq!(obj.len(), 2, "ts + kind only");
+        assert_eq!(parsed["kind"], "pomodoro_start");
     }
 }

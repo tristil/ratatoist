@@ -37,6 +37,7 @@ A single-slot 25-minute pomodoro timer paired with a tomato counter. Hitting `p`
 - `tomato_count: u64` and `tomato_date: YYYY-MM-DD` are stored in `ui_settings.json`, next to the Star Jar's keys.
 - The running-state (`pomodoro_started_at`) is deliberately not persisted. Session-scoped only.
 - `pomodoro_running` / `pomodoro_remaining_secs` are derived from the `Instant` at render time; no need to write either to disk.
+- **Every pomodoro start / complete / cancel also appends a timestamped line to the events log** (see [events-log.spec.md](events-log.spec.md)) — `{"ts": "...", "kind": "pomodoro_start" | "pomodoro_complete" | "pomodoro_cancel"}`. The running count for today is still the in-memory `tomato_count`; the log is for cross-day retrospective stats (cancellation rate, time-of-day patterns, weekly totals).
 
 ## Out of Scope (v1)
 

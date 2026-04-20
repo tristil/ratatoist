@@ -1570,7 +1570,19 @@ impl App {
         tokio::spawn(async move {
             let req = SyncRequest {
                 sync_token,
-                resource_types: vec![],
+                // Ask for items + notes so the response carries any
+                // server-side updates triggered by our commands — e.g. a
+                // recurring `item_close` advances the task's due date, and we
+                // need that delta to land before we drop the task from
+                // `pending_close_recurring`, or the task briefly reappears
+                // with its old due date.
+                resource_types: vec![
+                    "items".to_string(),
+                    "projects".to_string(),
+                    "sections".to_string(),
+                    "labels".to_string(),
+                    "notes".to_string(),
+                ],
                 commands,
             };
             let result = client.sync(&req).await;
@@ -1684,6 +1696,7 @@ impl App {
 
                 BgResult::CommandResults(resp) => {
                     let mut refresh_comments_for: Option<String> = None;
+                    let mut drop_from_pending_close: Vec<String> = Vec::new();
                     for (uuid, status) in &resp.sync_status {
                         if status.is_err() {
                             if let Some(op) = self.temp_id_pending.remove(uuid) {
@@ -1712,12 +1725,12 @@ impl App {
                                     }
                                 }
                                 OptimisticOp::TaskUpdated { task_id, .. } => {
-                                    // Recurring close landed: the items delta
-                                    // in this same response carries the new
-                                    // due date, so we can drop the pending
-                                    // placeholder and let the task reappear
-                                    // (now under tomorrow in Upcoming).
-                                    self.pending_close_recurring.remove(task_id);
+                                    // Defer the pending_close_recurring removal
+                                    // until after the items delta in this same
+                                    // response has been applied — otherwise the
+                                    // task briefly reappears with its old due
+                                    // date before the delta lands.
+                                    drop_from_pending_close.push(task_id.clone());
                                 }
                                 _ => {}
                             }
@@ -1726,9 +1739,12 @@ impl App {
                     for (temp_id, real_id) in &resp.temp_id_mapping {
                         self.apply_temp_id_mapping(temp_id, real_id);
                     }
-                    if !resp.sync_token.is_empty() {
-                        self.sync_token = resp.sync_token.clone();
-                        self.save_sync_token();
+                    // Apply items/notes/etc. from the command response so the
+                    // advanced due dates on recurring closes are visible before
+                    // we stop suppressing those tasks.
+                    self.apply_sync_delta(*resp);
+                    for task_id in drop_from_pending_close {
+                        self.pending_close_recurring.remove(&task_id);
                     }
                     if let Some(tid) = refresh_comments_for {
                         self.spawn_comments_fetch(tid);
@@ -4370,6 +4386,98 @@ mod tests {
         assert!(!app.tasks.iter().find(|t| t.id == "rec").unwrap().checked);
         assert!(app.pending_close_recurring.contains("rec"));
         assert_eq!(pending_cmd_types(&app), vec!["item_close".to_string()]);
+    }
+
+    /// Regression: when the server response to a recurring `item_close`
+    /// arrives, the task's advanced due date must be applied BEFORE the task
+    /// is dropped from `pending_close_recurring`. Otherwise the task briefly
+    /// reappears with its old due date (e.g. "today") before the next
+    /// incremental sync advances it — the user sees it flicker back into
+    /// Today and then vanish again.
+    #[test]
+    fn command_response_applies_items_before_clearing_pending_close() {
+        use tokio::runtime::Runtime;
+        let rt = Runtime::new().expect("runtime");
+        let _guard = rt.enter();
+
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        let today = crate::ui::dates::today_str();
+        app.tasks.push(Task {
+            id: "rec".to_string(),
+            content: "Brush teeth".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: today.clone(),
+                is_recurring: true,
+                string: Some("every day".to_string()),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.activate_today_view();
+        app.active_pane = Pane::Tasks;
+        app.selected_task = 0;
+
+        app.enqueue_complete_selected();
+        assert!(app.pending_close_recurring.contains("rec"));
+        let uuid = app.pending_commands[0].uuid.clone();
+
+        // Today's chrono::Local::now() + 1 day — server returns the advanced
+        // instance. Use a fixed far-future date to avoid wrap-around edge
+        // cases around month/year boundaries.
+        let advanced = "2099-01-01";
+        let resp_json = serde_json::json!({
+            "full_sync": false,
+            "sync_token": "next-token",
+            "items": [{
+                "id": "rec",
+                "content": "Brush teeth",
+                "description": "",
+                "project_id": "p1",
+                "child_order": 0,
+                "priority": 1,
+                "checked": false,
+                "is_deleted": false,
+                "due": {
+                    "date": advanced,
+                    "is_recurring": true,
+                    "string": "every day",
+                },
+            }],
+            "sync_status": { uuid: "ok" },
+            "temp_id_mapping": {},
+        });
+        let resp: SyncResponse =
+            serde_json::from_value(resp_json).expect("valid SyncResponse");
+        app.bg_tx
+            .try_send(BgResult::CommandResults(Box::new(resp)))
+            .expect("channel send");
+
+        app.drain_bg_results();
+
+        assert!(
+            !app.pending_close_recurring.contains("rec"),
+            "pending_close_recurring cleared once the response is processed"
+        );
+        let rec = app.tasks.iter().find(|t| t.id == "rec").expect("task");
+        assert_eq!(
+            rec.due.as_ref().map(|d| d.date.as_str()),
+            Some(advanced),
+            "items delta from command response advances the due date"
+        );
+        // With the advanced date in place, Today view no longer shows the
+        // task — no flicker of it briefly appearing with the old date.
+        let visible_ids: Vec<&str> =
+            app.visible_tasks().iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            !visible_ids.contains(&"rec"),
+            "task is not visible in Today once advanced"
+        );
     }
 
     /// Completing a recurring task must not flip it to checked optimistically —

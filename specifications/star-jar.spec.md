@@ -4,12 +4,14 @@ A passive counter in the left sidebar that earns a star every time the user comp
 
 ## Behavior
 
-- Every successful task completion (the `item_close` enqueue path — both non-recurring and recurring completions) adds **one star** to today's jar.
-- Reopening a task (`item_reopen`) does **not** subtract a star. The jar is a one-way tally of effort put in, not a reconciled net score — undoing a completion is still work done.
-- The jar resets when the local date rolls over. Detection is lazy: on any read (render, increment, load) the stored `star_date` is compared against today's local date; if they differ, the count is replaced with zero and the date updated.
+- **During the day, Todoist is the source of truth.** The jar reflects the number of tasks the user has actually completed today (local time) across every project, not a local tally. A background poll refetches completed tasks on `star_jar_poll_interval_secs` (default **60s**, minimum 30s) and replaces `star_count` with the fresh count. Idle-gated: if the user is idle past `idle_timeout_secs`, the poll is deferred and fires on their next keystroke.
+- **Optimistic local updates.** To keep the UI snappy between polls, `item_close` increments the local count immediately and `item_reopen` decrements it (saturating at zero). These are not authoritative — the next poll reconciles with Todoist's actual count, so a rapid close-then-reopen settles at the right number even if the optimistic math drifts briefly.
+- **After the day is over, the books are closed and the local store becomes the source of truth.** Once the date rolls over, Todoist is no longer consulted for that date's count — the frozen number is what we keep.
+- **On the first tick in a new local day, one final pass closes the books on the previous day.** `roll_star_jar_if_new_day` detects the rollover lazily (called from main-loop ticks, render paths, and on startup), captures the previous date and local count, resets `star_count` to 0 and `star_date` to today, and spawns a close-books fetch for the previous date. When that fetch returns, a `star_jar_close` record is appended to the events log with the authoritative count; if the fetch fails (offline, API error), the local count we captured is written instead so there's always a per-day record.
+- **Historical record lives in the events log**, not a separate store. See [events-log.spec.md](events-log.spec.md) — `star_jar_close` gives one row per completed day. No Todoist API access is needed to read history: a future stats view aggregates the log.
 - Count and date persist in `ui_settings.json` under `star_count` and `star_date` (ISO `YYYY-MM-DD`). Survives app restart — close and reopen within the same day and the jar keeps its count.
-- Ephemeral mode (the `--ephemeral` harness used in tests and throwaway sessions) skips the save, like every other ui_settings write.
-- **Every star also appends a timestamped line to the events log** (see [events-log.spec.md](events-log.spec.md)) — `{"ts": "...", "kind": "task_complete", "task_id": "<todoist task id>"}`. The current day's jar is still derived from `star_count` for rendering speed; the log is the durable record for future retrospective stats.
+- Ephemeral mode (the `--ephemeral` harness used in tests and throwaway sessions) skips both the save and the events-log append, like every other ui_settings write.
+- **Every increment also appends a timestamped line to the events log** — `{"ts": "...", "kind": "task_complete", "task_id": "<todoist task id>"}`. The log is the durable record; the jar's count is ephemeral state that can be reconstructed from the log plus a Todoist poll.
 
 ## Display
 

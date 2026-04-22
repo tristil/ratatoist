@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
@@ -457,6 +457,17 @@ pub struct CalendarEvent {
     pub calendar_name: String,
 }
 
+/// What a star-jar fetch is for. `Today` reconciles the live count;
+/// `CloseBooks` writes a one-shot `star_jar_close` event for a previous
+/// date that just rolled over. The fallback count is what we'll log if
+/// the close-books fetch fails — the locally-observed count at rollover
+/// time, so the per-day record is never silently empty.
+#[derive(Debug, Clone)]
+enum StarJarSyncMode {
+    Today,
+    CloseBooks { fallback_count: u64 },
+}
+
 enum BgResult {
     SyncDelta(Box<SyncResponse>),
     CommandResults(Box<SyncResponse>),
@@ -470,6 +481,11 @@ enum BgResult {
     GithubPrsFetched(Result<Vec<PullRequest>>),
     JiraCardsFetched(Result<Vec<JiraCard>>),
     AgendaFetched(Result<Vec<CalendarEvent>>),
+    StarJarSynced {
+        date: String,
+        mode: StarJarSyncMode,
+        count: Result<u64>,
+    },
     Comments {
         task_id: String,
         comments: Result<Vec<Comment>>,
@@ -598,6 +614,21 @@ pub struct App {
     /// Local date (YYYY-MM-DD) of the stored `star_count`. When a read
     /// observes this no longer matches today, the count resets to zero.
     pub star_date: String,
+    /// Last successful star-jar sync from Todoist (for any mode).
+    /// `None` until the first poll completes — the main-loop poller
+    /// uses this to schedule the next reconciliation. Session-scoped.
+    pub star_jar_fetched_at: Option<chrono::DateTime<Local>>,
+    /// True while a star-jar sync request is in flight, so the poller
+    /// doesn't fire overlapping fetches.
+    pub star_jar_loading: bool,
+    /// Star-jar reconciliation cadence in seconds. Loaded from
+    /// `ui_settings.json` (default 60s, clamped to a 30s minimum) — see
+    /// [`star-jar.spec.md`](../../../specifications/star-jar.spec.md).
+    pub star_jar_poll_interval_secs: u64,
+    /// Set when `is_idle()` deferred a poll that was otherwise due. The
+    /// next keystroke flushes it. Mirrors the `pending_pr_poll`
+    /// pattern.
+    pub pending_star_jar_poll: bool,
     pub all_view_active: bool,
     pub selected_all_item: usize,
     /// When the detail pane is open, this is the ID of the task being
@@ -718,6 +749,22 @@ fn load_agenda_poll_interval_secs() -> u64 {
         return secs.max(30);
     }
     DEFAULT_AGENDA_POLL_INTERVAL_SECS
+}
+
+/// Star jar reconciliation cadence. 60s feels live without burning the
+/// completed-tasks endpoint quota; the same idle gating used elsewhere
+/// pauses polling while the user's away.
+const DEFAULT_STAR_JAR_POLL_INTERVAL_SECS: u64 = 60;
+
+fn load_star_jar_poll_interval_secs() -> u64 {
+    let path = ratatoist_core::config::Config::config_dir().join("ui_settings.json");
+    if let Ok(src) = std::fs::read_to_string(&path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&src)
+        && let Some(secs) = val["star_jar_poll_interval_secs"].as_u64()
+    {
+        return secs.max(30);
+    }
+    DEFAULT_STAR_JAR_POLL_INTERVAL_SECS
 }
 
 /// Whether the StatsDock block should render. Defaults to `false` when
@@ -880,6 +927,7 @@ impl App {
             "github_prs_poll_interval_secs": self.github_prs_poll_interval_secs,
             "jira_cards_poll_interval_secs": self.jira_cards_poll_interval_secs,
             "agenda_poll_interval_secs": self.agenda_poll_interval_secs,
+            "star_jar_poll_interval_secs": self.star_jar_poll_interval_secs,
             "show_stats": self.show_stats,
             "star_count": self.star_count,
             "star_date": self.star_date,
@@ -909,15 +957,89 @@ impl App {
         }
     }
 
-    /// Roll the star jar forward if the local date has changed since it was
-    /// last observed. Called from any read path (render, increment) so the
-    /// jar resets lazily at midnight without a background timer.
+    /// Roll the star jar forward if the local date has changed since it
+    /// was last observed. Called from any read path (render, increment)
+    /// so the jar resets lazily at midnight without a background timer.
+    /// On rollover, spawns one close-books fetch for the previous date
+    /// (writes a `star_jar_close` event with the authoritative count when
+    /// it returns) and one fresh fetch for today. The local count we
+    /// observed at rollover is carried as a fallback so the per-day
+    /// record is never silently empty when the close-books fetch fails.
     fn roll_star_jar_if_new_day(&mut self) {
         let today = crate::ui::dates::today_str();
         if self.star_date != today {
-            self.star_date = today;
-            self.star_count = 0;
+            let prev_date = std::mem::replace(&mut self.star_date, today.clone());
+            let prev_count = std::mem::replace(&mut self.star_count, 0);
+            self.star_jar_fetched_at = None;
+            self.spawn_star_jar_fetch(
+                prev_date,
+                StarJarSyncMode::CloseBooks {
+                    fallback_count: prev_count,
+                },
+            );
+            self.spawn_star_jar_fetch(today, StarJarSyncMode::Today);
         }
+    }
+
+    /// Spawn a background fetch that counts tasks completed on `date`
+    /// (local YYYY-MM-DD) according to Todoist. Sends a
+    /// `BgResult::StarJarSynced` with the count or an error. The window
+    /// is `[local_midnight(date), local_midnight(date+1))` so events at
+    /// the boundary land on the correct local day even when the API
+    /// returns UTC `completed_at` timestamps.
+    fn spawn_star_jar_fetch(&mut self, date: String, mode: StarJarSyncMode) {
+        // Ephemeral mode (tests, throwaway runs) skips network fetches —
+        // and crucially `tokio::spawn` panics outside a runtime, which
+        // is exactly the test setup.
+        if self.ephemeral {
+            return;
+        }
+        // Today-mode polls are gated by `star_jar_loading` so we don't
+        // pile up overlapping fetches; close-books is one-shot per
+        // rollover so it always runs.
+        if matches!(mode, StarJarSyncMode::Today) && self.star_jar_loading {
+            return;
+        }
+        if matches!(mode, StarJarSyncMode::Today) {
+            self.star_jar_loading = true;
+        }
+        let client = Arc::clone(&self.client);
+        let tx = self.bg_tx.clone();
+        let date_for_task = date.clone();
+        let mode_for_task = mode.clone();
+        tokio::spawn(async move {
+            let count = fetch_star_jar_count(&client, &date_for_task).await;
+            let _ = tx
+                .send(BgResult::StarJarSynced {
+                    date: date_for_task,
+                    mode: mode_for_task,
+                    count,
+                })
+                .await;
+        });
+    }
+
+    /// Fire a star-jar reconciliation if it's been more than the
+    /// configured interval since the last successful fetch. Idle-gated
+    /// so polling pauses while the user's away. Mirrors
+    /// `maybe_poll_github_prs`.
+    fn maybe_poll_star_jar(&mut self) {
+        if self.star_jar_loading {
+            return;
+        }
+        let elapsed_secs = self
+            .star_jar_fetched_at
+            .map(|at| (Local::now() - at).num_seconds())
+            .unwrap_or(i64::MAX);
+        if elapsed_secs < self.star_jar_poll_interval_secs as i64 {
+            return;
+        }
+        if self.is_idle() {
+            self.pending_star_jar_poll = true;
+            return;
+        }
+        let date = self.star_date.clone();
+        self.spawn_star_jar_fetch(date, StarJarSyncMode::Today);
     }
 
     /// Append one record to the events log (`events.jsonl` next to
@@ -978,6 +1100,17 @@ impl App {
             self.pomodoro_session_tasks.insert(0, title);
         }
         self.append_event("task_complete", extras);
+    }
+
+    /// Optimistically remove one star from today's jar to mirror an
+    /// `item_reopen`. Saturates at zero. The next Todoist poll
+    /// reconciles authoritatively, so this is purely for UI snappiness
+    /// — no events-log entry, no per-task bookkeeping. See
+    /// `star-jar.spec.md`.
+    pub fn decrement_star_jar(&mut self) {
+        self.roll_star_jar_if_new_day();
+        self.star_count = self.star_count.saturating_sub(1);
+        self.save_ui_settings();
     }
 
     /// Roll the tomato counter forward on a day change. Analogous to
@@ -1144,6 +1277,10 @@ impl App {
             show_stats,
             star_count,
             star_date,
+            star_jar_fetched_at: None,
+            star_jar_loading: false,
+            star_jar_poll_interval_secs: load_star_jar_poll_interval_secs(),
+            pending_star_jar_poll: false,
             pomodoro_started_at: None,
             pomodoro_session_id: None,
             pomodoro_session_tasks: Vec::new(),
@@ -1261,7 +1398,9 @@ impl App {
             // Roll the star jar to zero when the local date has changed
             // since the last observed count (e.g. app left running past
             // midnight). Mutates state so render can stay `&App`.
+            // Also kicks off the close-books and today fetches.
             self.roll_star_jar_if_new_day();
+            self.maybe_poll_star_jar();
             self.roll_tomato_jar_if_new_day();
             // Completion check for the active pomodoro, if any — cheap
             // enough to run every frame.
@@ -1289,6 +1428,11 @@ impl App {
                 if was_idle && self.pending_agenda_poll {
                     self.pending_agenda_poll = false;
                     self.spawn_agenda_fetch();
+                }
+                if was_idle && self.pending_star_jar_poll {
+                    self.pending_star_jar_poll = false;
+                    let date = self.star_date.clone();
+                    self.spawn_star_jar_fetch(date, StarJarSyncMode::Today);
                 }
 
                 if self.error.is_some() {
@@ -1830,6 +1974,53 @@ impl App {
                     }
                 }
 
+                BgResult::StarJarSynced { date, mode, count } => {
+                    if matches!(mode, StarJarSyncMode::Today) {
+                        self.star_jar_loading = false;
+                    }
+                    match (mode, count) {
+                        (StarJarSyncMode::Today, Ok(n)) => {
+                            // Only overwrite if the date the fetch was
+                            // for is still today; a fetch that started
+                            // before midnight and returned after the
+                            // rollover should not stomp the new day's
+                            // freshly-zeroed count.
+                            if date == self.star_date {
+                                self.star_count = n;
+                                self.star_jar_fetched_at = Some(Local::now());
+                                self.save_ui_settings();
+                            }
+                        }
+                        (StarJarSyncMode::Today, Err(e)) => {
+                            tracing::warn!(error = %e, "star jar today sync failed");
+                        }
+                        (StarJarSyncMode::CloseBooks { fallback_count }, Ok(n)) => {
+                            self.append_event(
+                                "star_jar_close",
+                                serde_json::json!({ "date": date, "count": n }),
+                            );
+                            tracing::debug!(
+                                date = %date,
+                                authoritative = n,
+                                local = fallback_count,
+                                "star jar books closed"
+                            );
+                        }
+                        (StarJarSyncMode::CloseBooks { fallback_count }, Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                date = %date,
+                                fallback = fallback_count,
+                                "star jar close-books fetch failed; logging local count"
+                            );
+                            self.append_event(
+                                "star_jar_close",
+                                serde_json::json!({ "date": date, "count": fallback_count }),
+                            );
+                        }
+                    }
+                }
+
                 BgResult::Comments {
                     task_id,
                     comments,
@@ -1920,7 +2111,7 @@ impl App {
         let pid = project_id.clone();
 
         tokio::spawn(async move {
-            let records = client.get_completed_tasks(Some(&pid), None).await;
+            let records = client.get_completed_tasks(Some(&pid), None, None).await;
             let _ = tx
                 .send(BgResult::CompletedTasks {
                     project_id: pid,
@@ -2405,12 +2596,15 @@ impl App {
             t.checked = !was_checked;
         }
 
-        // Earn a star for today whenever we're *closing* a task (either
-        // recurring advance or non-recurring complete). Reopens don't
-        // subtract — the jar is a one-way record of effort, per
-        // star-jar.spec.md.
+        // Optimistic star-jar update so the UI reflects the action
+        // immediately; the next Todoist poll reconciles authoritatively.
+        // Closing increments and emits a `task_complete` event; reopening
+        // decrements (saturating at zero) so undoing a tap feels snappy
+        // — see star-jar.spec.md.
         if !was_checked {
             self.increment_star_jar(&task_id);
+        } else {
+            self.decrement_star_jar();
         }
 
         // item_close is the command that mirrors the official Todoist UI:
@@ -3872,6 +4066,46 @@ async fn fetch_jira_cards() -> Result<Vec<JiraCard>> {
 
 /// Fetch today's events blended across every subscribed, visible Google
 /// Calendar. Enumerates calendars via `gws calendar calendarList list`,
+/// Count tasks completed on `date` (local YYYY-MM-DD) according to
+/// Todoist. Issues a single completed-tasks fetch with `since` set to
+/// the local-midnight of `date` (in UTC for the API), then filters the
+/// results to those whose `completed_at` falls within the local-day
+/// window. Caps at 200 results — the Todoist endpoint maxes there, so
+/// any user finishing >200 tasks in a day gets the floor of 200.
+async fn fetch_star_jar_count(client: &Arc<TodoistClient>, date: &str) -> Result<u64> {
+    use chrono::{NaiveDate, TimeZone};
+
+    let naive = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .with_context(|| format!("invalid star-jar date: {date}"))?;
+    let start_local = Local
+        .from_local_datetime(&naive.and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .context("ambiguous local midnight")?;
+    let end_local = start_local + chrono::Duration::days(1);
+    let since_utc = start_local.with_timezone(&chrono::Utc).to_rfc3339();
+
+    let tasks = client
+        .get_completed_tasks(None, Some(&since_utc), Some(200))
+        .await?;
+    let mut count: u64 = 0;
+    for t in tasks {
+        let Some(completed) = t.completed_at.as_deref() else {
+            continue;
+        };
+        // Todoist returns `completed_at` as RFC3339 in UTC; parse and
+        // bucket by the user's local clock so the boundary is the same
+        // one the rest of the UI uses.
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(completed) else {
+            continue;
+        };
+        let local = parsed.with_timezone(&Local);
+        if local >= start_local && local < end_local {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// filters to entries where `selected == true && hidden != true`, then
 /// fetches events from each one concurrently and merges the results sorted
 /// by start time. Returns an error only if enumeration fails or every
@@ -5319,10 +5553,11 @@ mod tests {
         app.enqueue_complete_task_by_id("t_recur".to_string());
         assert_eq!(app.star_count, 2);
 
-        // Reopening the non-recurring task must NOT decrement (and actually
-        // enqueues item_reopen because `checked` is already true).
+        // Reopening the non-recurring task optimistically decrements; the
+        // next Todoist poll would also have decremented it, this just
+        // gets there immediately for UI snappiness.
         app.enqueue_complete_task_by_id("t_once".to_string());
-        assert_eq!(app.star_count, 2, "reopen does not remove stars");
+        assert_eq!(app.star_count, 1, "reopen optimistically removes one star");
 
         // Simulate the local date rolling over; the next completion ticks
         // from zero on the new day, not from yesterday's final count.
@@ -5331,6 +5566,22 @@ mod tests {
         app.enqueue_complete_task_by_id("t_once".to_string());
         assert_eq!(app.star_count, 1, "jar reset at day rollover");
         assert_eq!(app.star_date, crate::ui::dates::today_str());
+    }
+
+    /// `decrement_star_jar` saturates at zero — reopening a task when
+    /// the local count is already zero (e.g. the optimistic decrement
+    /// raced ahead of a poll that hadn't observed the close yet) must
+    /// not underflow. The next Todoist poll will reconcile to the true
+    /// count anyway.
+    #[test]
+    fn decrement_star_jar_saturates_at_zero() {
+        let mut app = test_app();
+        assert_eq!(app.star_count, 0);
+        app.decrement_star_jar();
+        assert_eq!(app.star_count, 0, "decrement at zero is a no-op");
+        app.star_count = 1;
+        app.decrement_star_jar();
+        assert_eq!(app.star_count, 0);
     }
 
     /// `p` toggles the pomodoro: start sets `pomodoro_started_at` and a

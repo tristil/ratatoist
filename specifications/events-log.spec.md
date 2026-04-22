@@ -15,12 +15,13 @@ Append-only log of stat-worthy events (task completions, pomodoro starts / compl
 Each line is a single JSON object. **Required** fields on every record:
 
 - `ts` — RFC 3339 local-time string with offset (`2026-04-18T14:32:17-04:00`), produced by `chrono::Local::now().to_rfc3339()`. Local rather than UTC so stats-by-hour-of-day work without timezone math downstream.
-- `kind` — enum string. Current values: `task_complete`, `pomodoro_start`, `pomodoro_complete`, `pomodoro_cancel`. New kinds may be added; readers must ignore unknown kinds.
+- `kind` — enum string. Current values: `task_complete`, `pomodoro_start`, `pomodoro_complete`, `pomodoro_cancel`, `star_jar_close`. New kinds may be added; readers must ignore unknown kinds.
 
 **Per-kind fields:**
 
 - `task_complete` adds `task_id` — the Todoist task ID that was closed. Lets a future view link a completion back to the originating task (title, project, priority, labels — all live in the Todoist sync state). When the completion happened *during* an active pomodoro, the record also carries `pomodoro_session_id` — the `session_id` of the running pomodoro, as an RFC 3339 timestamp. Completions outside a pomodoro omit the field.
 - `pomodoro_start`, `pomodoro_complete`, `pomodoro_cancel` each carry a `session_id` — the RFC 3339 timestamp of the pomodoro's start, serving as a stable identifier across its lifecycle. A reader can pair a `start` with its matching `complete` or `cancel` by equal `session_id`, and join all `task_complete` rows whose `pomodoro_session_id` matches.
+- `star_jar_close` adds `date` — the local `YYYY-MM-DD` whose star jar is being frozen — and `count`, the authoritative number of tasks completed on that date (from a Todoist re-fetch when reachable, falling back to the locally-observed count otherwise). Written exactly once per day-rollover the app observes; gaps (the app wasn't open for several days) leave intervening days unwritten rather than backfilled.
 
 Example lines:
 

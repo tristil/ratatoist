@@ -587,11 +587,13 @@ pub struct App {
     /// Persisted in `ui_settings.json` alongside `star_date`; see
     /// [`star-jar.spec.md`](../../../specifications/star-jar.spec.md).
     pub star_count: u64,
-    /// Wall-clock instant the current 25-minute pomodoro began, or `None`
-    /// when no pomodoro is running. Session-scoped — deliberately NOT
-    /// persisted; closing the app abandons the timer. See
+    /// Wall-clock time the current 25-minute pomodoro began, or `None`
+    /// when no pomodoro is running. Persisted to `pomodoro_session.json`
+    /// so the session survives app restart and is shared across
+    /// concurrent ratatoist instances on the same machine. Wall-clock
+    /// (not `Instant`) so it remains meaningful across processes. See
     /// [`pomodoro.spec.md`](../../../specifications/pomodoro.spec.md).
-    pub pomodoro_started_at: Option<Instant>,
+    pub pomodoro_started_at: Option<chrono::DateTime<Local>>,
     /// Stable identifier for the running pomodoro — the RFC 3339
     /// timestamp of its start. `Some` exactly when `pomodoro_started_at`
     /// is `Some`. Used both as the event-log `session_id` and as the
@@ -783,6 +785,63 @@ fn load_show_stats() -> bool {
 
 /// Length of a single pomodoro. Fixed; see `pomodoro.spec.md`.
 pub const POMODORO_DURATION: Duration = Duration::from_secs(25 * 60);
+
+/// Persisted running-session record. The file exists exactly when a
+/// pomodoro is running; both fields together identify and time the
+/// session for any process that reads it.
+#[derive(Debug, Clone)]
+struct PomodoroSession {
+    session_id: String,
+    started_at: chrono::DateTime<Local>,
+}
+
+fn pomodoro_session_path() -> std::path::PathBuf {
+    ratatoist_core::config::Config::config_dir().join("pomodoro_session.json")
+}
+
+/// Read the persisted pomodoro session, if any. Returns `None` when the
+/// file is missing, malformed, or unreadable — callers treat any of
+/// those as "no session running" and the next start will overwrite.
+fn load_pomodoro_session() -> Option<PomodoroSession> {
+    let src = std::fs::read_to_string(pomodoro_session_path()).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&src).ok()?;
+    let session_id = val["session_id"].as_str()?.to_string();
+    let started_at_unix = val["started_at"].as_i64()?;
+    let started_at = chrono::DateTime::<chrono::Utc>::from_timestamp(started_at_unix, 0)?
+        .with_timezone(&Local);
+    Some(PomodoroSession {
+        session_id,
+        started_at,
+    })
+}
+
+/// Write the running session to disk so a restart or a second instance
+/// can pick it up. Best-effort; write failures are logged but not
+/// surfaced — the session continues in memory either way.
+fn save_pomodoro_session(session: &PomodoroSession) {
+    let dir = ratatoist_core::config::Config::config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let json = serde_json::json!({
+        "session_id": session.session_id,
+        "started_at": session.started_at.timestamp(),
+    });
+    if let Err(e) = std::fs::write(
+        pomodoro_session_path(),
+        serde_json::to_string_pretty(&json).unwrap_or_default(),
+    ) {
+        tracing::warn!(error = %e, "failed to persist pomodoro session");
+    }
+}
+
+/// Remove the persisted session file. Called on cancel and on natural
+/// completion; `NotFound` is fine (another instance got there first).
+fn clear_pomodoro_session() {
+    if let Err(e) = std::fs::remove_file(pomodoro_session_path())
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(error = %e, "failed to remove pomodoro session file");
+    }
+}
 
 /// Build a single event-log line (JSON + trailing newline). Pure —
 /// separated from the file write so tests can verify the on-disk shape
@@ -1134,6 +1193,9 @@ impl App {
         if let Some(session_id) = self.pomodoro_session_id.take() {
             self.pomodoro_started_at = None;
             self.pomodoro_session_tasks.clear();
+            if !self.ephemeral {
+                clear_pomodoro_session();
+            }
             self.append_event(
                 "pomodoro_cancel",
                 serde_json::json!({ "session_id": session_id }),
@@ -1142,10 +1204,17 @@ impl App {
             // The session_id is the RFC 3339 of start — stable, already
             // monotonic, and doubles as the join key on task_complete
             // events stamped during the session.
-            let session_id = chrono::Local::now().to_rfc3339();
-            self.pomodoro_started_at = Some(Instant::now());
+            let started_at = chrono::Local::now();
+            let session_id = started_at.to_rfc3339();
+            self.pomodoro_started_at = Some(started_at);
             self.pomodoro_session_id = Some(session_id.clone());
             self.pomodoro_session_tasks.clear();
+            if !self.ephemeral {
+                save_pomodoro_session(&PomodoroSession {
+                    session_id: session_id.clone(),
+                    started_at,
+                });
+            }
             self.append_event(
                 "pomodoro_start",
                 serde_json::json!({ "session_id": session_id }),
@@ -1156,25 +1225,73 @@ impl App {
     /// Remaining time on the active pomodoro, or `None` when no pomodoro
     /// is running. Clamps to zero once the full duration has elapsed so
     /// the status-bar countdown holds at `00:00` for the frame between
-    /// elapse and `maybe_award_tomato` clearing the state.
+    /// elapse and `maybe_award_tomato` clearing the state. Computed from
+    /// wall-clock so a session resumed after restart shows the right
+    /// remaining time.
     pub fn pomodoro_remaining(&self) -> Option<Duration> {
         let start = self.pomodoro_started_at?;
-        Some(POMODORO_DURATION.saturating_sub(start.elapsed()))
+        let elapsed_secs = (chrono::Local::now() - start).num_seconds().max(0) as u64;
+        Some(POMODORO_DURATION.saturating_sub(Duration::from_secs(elapsed_secs)))
+    }
+
+    /// Reconcile in-memory pomodoro state with `pomodoro_session.json`
+    /// once per main-loop tick so a second running instance picks up
+    /// our session (and we pick up theirs), and so a cancel in one
+    /// instance silently clears the other's in-memory state without
+    /// re-emitting the cancel event. See `pomodoro.spec.md`.
+    fn sync_pomodoro_from_disk(&mut self) {
+        if self.ephemeral {
+            return;
+        }
+        self.apply_pomodoro_disk_state(load_pomodoro_session());
+    }
+
+    /// Pure-state half of `sync_pomodoro_from_disk` — no file IO so the
+    /// reconciliation logic can be unit tested. See that method's
+    /// docstring for the full behavior.
+    fn apply_pomodoro_disk_state(&mut self, on_disk: Option<PomodoroSession>) {
+        match (on_disk, self.pomodoro_session_id.as_ref()) {
+            (Some(disk), Some(mem_id)) if &disk.session_id == mem_id => {}
+            (Some(disk), _) => {
+                // Another instance started a session (or replaced ours);
+                // adopt without emitting events — the originating
+                // instance already logged the start.
+                self.pomodoro_started_at = Some(disk.started_at);
+                self.pomodoro_session_id = Some(disk.session_id);
+                self.pomodoro_session_tasks.clear();
+            }
+            (None, Some(_)) => {
+                // The file went away — another instance cancelled or
+                // completed the session and logged the corresponding
+                // event. Clear our local mirror silently.
+                self.pomodoro_started_at = None;
+                self.pomodoro_session_id = None;
+                self.pomodoro_session_tasks.clear();
+            }
+            (None, None) => {}
+        }
     }
 
     /// If a pomodoro has fully elapsed, increment the tomato count and
     /// clear the running state. Called every main-loop tick; cheap (a
-    /// couple of compares in the common no-op case).
+    /// couple of compares in the common no-op case). Also fires on the
+    /// first tick after a restart when the persisted session has
+    /// already aged past 25:00 — the tomato is still credited because
+    /// the work happened, even if the UI was off.
     pub fn maybe_award_tomato(&mut self) {
         let Some(start) = self.pomodoro_started_at else {
             return;
         };
-        if start.elapsed() < POMODORO_DURATION {
+        let elapsed_secs = (chrono::Local::now() - start).num_seconds().max(0) as u64;
+        if Duration::from_secs(elapsed_secs) < POMODORO_DURATION {
             return;
         }
         let session_id = self.pomodoro_session_id.take();
         self.pomodoro_started_at = None;
         self.pomodoro_session_tasks.clear();
+        if !self.ephemeral {
+            clear_pomodoro_session();
+        }
         self.roll_tomato_jar_if_new_day();
         self.tomato_count = self.tomato_count.saturating_add(1);
         self.save_ui_settings();
@@ -1201,6 +1318,17 @@ impl App {
         let (star_count, star_date) = load_star_jar();
         let (tomato_count, tomato_date) = load_tomato_jar();
         let show_stats = load_show_stats();
+        // Resume any pomodoro the previous process (or another running
+        // instance) left behind. The first main-loop tick will fire
+        // `maybe_award_tomato` and credit a tomato if the resumed
+        // session has already aged past 25:00.
+        let resumed = if ephemeral {
+            None
+        } else {
+            load_pomodoro_session()
+        };
+        let pomodoro_started_at = resumed.as_ref().map(|s| s.started_at);
+        let pomodoro_session_id = resumed.map(|s| s.session_id);
 
         Self {
             projects: Vec::new(),
@@ -1281,8 +1409,8 @@ impl App {
             star_jar_loading: false,
             star_jar_poll_interval_secs: load_star_jar_poll_interval_secs(),
             pending_star_jar_poll: false,
-            pomodoro_started_at: None,
-            pomodoro_session_id: None,
+            pomodoro_started_at,
+            pomodoro_session_id,
             pomodoro_session_tasks: Vec::new(),
             tomato_count,
             tomato_date,
@@ -1402,8 +1530,13 @@ impl App {
             self.roll_star_jar_if_new_day();
             self.maybe_poll_star_jar();
             self.roll_tomato_jar_if_new_day();
+            // Pick up sessions started/cancelled by another instance
+            // (or restored from disk after our own restart) before the
+            // tick checks for natural completion.
+            self.sync_pomodoro_from_disk();
             // Completion check for the active pomodoro, if any — cheap
-            // enough to run every frame.
+            // enough to run every frame. Also fires immediately after a
+            // restart when the resumed session is already past 25:00.
             self.maybe_award_tomato();
 
             terminal.draw(|frame| ui::draw(frame, self))?;
@@ -5626,6 +5759,74 @@ mod tests {
         assert_eq!(app.tomato_count, 0, "cancel doesn't award a tomato");
     }
 
+    /// `apply_pomodoro_disk_state` reconciles in-memory state with
+    /// what's on disk: adopt a session a sibling instance started,
+    /// silently clear when the file disappears (sibling cancelled or
+    /// completed), and leave matching state alone. This is what makes
+    /// "another ratatoist session running at the same time should open
+    /// up the pomodoro session window" work.
+    #[test]
+    fn pomodoro_adopts_session_from_other_instance() {
+        let mut app = test_app();
+        let started_at = chrono::Local::now() - chrono::Duration::minutes(5);
+        let disk = PomodoroSession {
+            session_id: started_at.to_rfc3339(),
+            started_at,
+        };
+
+        // Empty in-memory + session on disk → adopt.
+        app.apply_pomodoro_disk_state(Some(disk.clone()));
+        assert_eq!(
+            app.pomodoro_session_id.as_deref(),
+            Some(disk.session_id.as_str()),
+            "adopt session another instance started"
+        );
+        assert!(app.pomodoro_started_at.is_some());
+        let remaining = app.pomodoro_remaining().expect("session running");
+        // ~20 minutes left after a 5-minute-ago start.
+        assert!(
+            remaining.as_secs() < 21 * 60 && remaining.as_secs() > 19 * 60,
+            "remaining computed from wall-clock start, got {}s",
+            remaining.as_secs()
+        );
+
+        // Same session on disk → no-op (no reset of session_tasks).
+        app.pomodoro_session_tasks.push("Local-only task".to_string());
+        app.apply_pomodoro_disk_state(Some(disk.clone()));
+        assert_eq!(
+            app.pomodoro_session_tasks,
+            vec!["Local-only task".to_string()],
+            "matching session id leaves local task list alone"
+        );
+
+        // Disk file disappears (sibling cancelled or completed) → clear
+        // local state silently. No event emitted because the originating
+        // instance already logged it.
+        app.apply_pomodoro_disk_state(None);
+        assert!(app.pomodoro_session_id.is_none());
+        assert!(app.pomodoro_started_at.is_none());
+        assert!(app.pomodoro_session_tasks.is_empty());
+    }
+
+    /// A session started >25 minutes ago should immediately credit a
+    /// tomato when `maybe_award_tomato` runs — this is the
+    /// "reopen-after-the-timer-finished" path. Wall-clock based so the
+    /// test seeds a chrono datetime in the past.
+    #[test]
+    fn pomodoro_credits_tomato_when_resumed_session_already_elapsed() {
+        let mut app = test_app();
+        app.tomato_count = 0;
+        app.pomodoro_started_at =
+            Some(chrono::Local::now() - chrono::Duration::minutes(30));
+        app.pomodoro_session_id = Some("resumed-session".to_string());
+
+        app.maybe_award_tomato();
+
+        assert_eq!(app.tomato_count, 1, "elapsed > 25min credits a tomato");
+        assert!(app.pomodoro_started_at.is_none());
+        assert!(app.pomodoro_session_id.is_none());
+    }
+
     /// Completing a task while a pomodoro is running should push the
     /// task's title onto `pomodoro_session_tasks` (newest first) and
     /// the task_complete event that gets appended must carry the
@@ -5707,9 +5908,7 @@ mod tests {
 
         // Backdate the start so the timer has fully elapsed.
         app.pomodoro_started_at = Some(
-            Instant::now()
-                .checked_sub(POMODORO_DURATION)
-                .expect("Instant should subtract"),
+            chrono::Local::now() - chrono::Duration::seconds(POMODORO_DURATION.as_secs() as i64),
         );
         app.maybe_award_tomato();
         assert_eq!(app.tomato_count, 1, "completion awards a tomato");
@@ -5729,9 +5928,7 @@ mod tests {
         // A second elapsed pomodoro on a different date resets first.
         app.tomato_date = "1999-01-01".to_string();
         app.pomodoro_started_at = Some(
-            Instant::now()
-                .checked_sub(POMODORO_DURATION)
-                .expect("Instant should subtract"),
+            chrono::Local::now() - chrono::Duration::seconds(POMODORO_DURATION.as_secs() as i64),
         );
         app.maybe_award_tomato();
         assert_eq!(app.tomato_count, 1, "rollover zeroed then incremented");

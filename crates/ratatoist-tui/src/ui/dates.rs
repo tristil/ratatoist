@@ -77,6 +77,56 @@ pub fn current_local_hour() -> u32 {
     chrono::Local::now().hour()
 }
 
+/// Current local minute-of-day (0..=1439). Used by the time-label filter
+/// on the Today and All views so labels like `9:30am` get minute-grain
+/// resolution rather than hour-grain.
+pub fn current_local_minute_of_day() -> u32 {
+    use chrono::Timelike;
+    let now = chrono::Local::now();
+    now.hour() * 60 + now.minute()
+}
+
+/// Parse a label like `"2pm"`, `"9am"`, `"9:30am"`, or `"11:30pm"` as a
+/// minute-of-day (0..=1439). Returns `None` for anything that doesn't
+/// match the strict `^\d{1,2}(:\d{2})?(am|pm)$` shape — those are
+/// treated as ordinary labels by the filter. Lowercase only, mirroring
+/// the existing `evening` / `work` filters.
+fn parse_time_label(label: &str) -> Option<u32> {
+    let (rest, is_pm) = if let Some(r) = label.strip_suffix("am") {
+        (r, false)
+    } else if let Some(r) = label.strip_suffix("pm") {
+        (r, true)
+    } else {
+        return None;
+    };
+    let (h, m) = match rest.split_once(':') {
+        Some((h, m)) => (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?),
+        None => (rest.parse::<u32>().ok()?, 0),
+    };
+    if h == 0 || h > 12 || m > 59 {
+        return None;
+    }
+    let h24 = match (h, is_pm) {
+        (12, false) => 0,
+        (12, true) => 12,
+        (h, false) => h,
+        (h, true) => h + 12,
+    };
+    Some(h24 * 60 + m)
+}
+
+/// True when any of `labels` parses as a clock time strictly later than
+/// `current_minute_of_day` — the task is hidden until that time
+/// arrives. If multiple time labels are present, the latest one wins
+/// (the task stays hidden until *all* are satisfied). Labels that don't
+/// match the time-label format are ignored by this predicate.
+pub fn time_label_hidden(labels: &[String], current_minute_of_day: u32) -> bool {
+    labels
+        .iter()
+        .filter_map(|l| parse_time_label(l))
+        .any(|m| current_minute_of_day < m)
+}
+
 /// True when a task carries the `evening` label and the current local hour
 /// is before 17:00. Kept as a standalone predicate so tests can pass a
 /// specific hour without touching the clock.
@@ -240,6 +290,53 @@ mod tests {
         // Exact lowercase only — "Work" is not matched.
         let capitalized = vec!["Work".to_string()];
         assert!(!work_weekend_hidden(&capitalized, true));
+    }
+
+    #[test]
+    fn time_label_parses_strict_format_only() {
+        // Hours-only forms.
+        assert_eq!(parse_time_label("9am"), Some(9 * 60));
+        assert_eq!(parse_time_label("2pm"), Some(14 * 60));
+        assert_eq!(parse_time_label("12am"), Some(0)); // midnight
+        assert_eq!(parse_time_label("12pm"), Some(12 * 60)); // noon
+        assert_eq!(parse_time_label("11pm"), Some(23 * 60));
+        // With minutes.
+        assert_eq!(parse_time_label("9:30am"), Some(9 * 60 + 30));
+        assert_eq!(parse_time_label("11:30pm"), Some(23 * 60 + 30));
+        // Invalid forms — fall through to "ordinary label" so the filter
+        // ignores them.
+        assert_eq!(parse_time_label("evening"), None);
+        assert_eq!(parse_time_label("pm"), None);
+        assert_eq!(parse_time_label("13pm"), None);
+        assert_eq!(parse_time_label("9:60am"), None);
+        assert_eq!(parse_time_label("9 am"), None);
+        assert_eq!(parse_time_label("9AM"), None); // strict lowercase
+        assert_eq!(parse_time_label("0am"), None); // 0am isn't a thing
+    }
+
+    #[test]
+    fn time_label_hides_until_clock_arrives() {
+        let two_pm = vec!["2pm".to_string()];
+        let nine_thirty_am = vec!["9:30am".to_string()];
+        let unrelated = vec!["focus".to_string()];
+
+        // 2pm label hidden through the morning, visible from 14:00 on.
+        assert!(time_label_hidden(&two_pm, 9 * 60));
+        assert!(time_label_hidden(&two_pm, 13 * 60 + 59));
+        assert!(!time_label_hidden(&two_pm, 14 * 60));
+        assert!(!time_label_hidden(&two_pm, 20 * 60));
+
+        // Minute granularity matters for 9:30am.
+        assert!(time_label_hidden(&nine_thirty_am, 9 * 60 + 29));
+        assert!(!time_label_hidden(&nine_thirty_am, 9 * 60 + 30));
+
+        // Unrelated labels do nothing.
+        assert!(!time_label_hidden(&unrelated, 0));
+
+        // Multiple time labels — hidden until the latest one arrives.
+        let two_and_four = vec!["2pm".to_string(), "4pm".to_string()];
+        assert!(time_label_hidden(&two_and_four, 14 * 60 + 1));
+        assert!(!time_label_hidden(&two_and_four, 16 * 60));
     }
 
     #[test]

@@ -2175,6 +2175,7 @@ impl App {
         // Today tasks (same filter as Today view, minus overdue-collapse).
         let today = crate::ui::dates::today_str();
         let current_hour = crate::ui::dates::current_local_hour();
+        let current_minute = crate::ui::dates::current_local_minute_of_day();
         let is_weekend = crate::ui::dates::is_weekend_local();
         for (i, t) in self.tasks.iter().enumerate() {
             if t.is_deleted || t.checked || t.parent_id.is_some() {
@@ -2187,6 +2188,9 @@ impl App {
                 continue;
             }
             if crate::ui::dates::work_weekend_hidden(&t.labels, is_weekend) {
+                continue;
+            }
+            if crate::ui::dates::time_label_hidden(&t.labels, current_minute) {
                 continue;
             }
             let due_today_or_overdue = t
@@ -3446,6 +3450,7 @@ impl App {
         if self.today_view_active {
             let today = crate::ui::dates::today_str();
             let current_hour = crate::ui::dates::current_local_hour();
+            let current_minute = crate::ui::dates::current_local_minute_of_day();
             let is_weekend = crate::ui::dates::is_weekend_local();
             let mut tasks: Vec<&Task> = self
                 .tasks
@@ -3461,6 +3466,9 @@ impl App {
                         return false;
                     }
                     if crate::ui::dates::work_weekend_hidden(&t.labels, is_weekend) {
+                        return false;
+                    }
+                    if crate::ui::dates::time_label_hidden(&t.labels, current_minute) {
                         return false;
                     }
                     let is_today_or_overdue = t

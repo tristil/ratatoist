@@ -107,10 +107,12 @@ impl TodoistClient {
 
     /// Completed tasks are not available through the Sync API.
     /// Uses `annotate_items=1` to get the full Task object (with parent_id, priority, etc.).
+    /// `limit` defaults to 30 (Todoist's default) when `None`; max accepted by the API is 200.
     pub async fn get_completed_tasks(
         &self,
         project_id: Option<&str>,
         since: Option<&str>,
+        limit: Option<u32>,
     ) -> Result<Vec<Task>> {
         let start = Instant::now();
         let mut url = format!("{BASE_URL}/tasks/completed?annotate_items=1");
@@ -120,6 +122,9 @@ impl TodoistClient {
         }
         if let Some(s) = since {
             url = format!("{url}&since={s}");
+        }
+        if let Some(n) = limit {
+            url = format!("{url}&limit={n}");
         }
 
         debug!(url = %url, "GET completed tasks");

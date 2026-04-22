@@ -15,7 +15,8 @@ A single-slot 25-minute pomodoro timer paired with a tomato counter. Hitting `p`
   
   No sound, no modal — just the tomato appearing in the sidebar box.
 - **Day rollover during a running pomodoro is fine:** the timer keeps counting. When it completes, the tomato is credited to the *current* local date — if that's the new day, so be it. The box's rollover is lazy, same as the Star Jar (compared on each tick).
-- **App restart mid-pomodoro cancels the timer.** `pomodoro_started_at` is in-memory only, never persisted. If the user closes ratatoist 10 minutes in, the pomodoro is gone — this matches the intuition that "closing the app breaks the session."
+- **The session survives app restart.** Start time is wall-clock and persisted (see below), so closing ratatoist 10 minutes in and reopening 5 minutes later resumes a session with 10 minutes remaining. If the user reopens after more than 25 minutes, the next `maybe_award_tomato` tick observes elapsed ≥ 25:00 and credits a tomato as if the app had been running the whole time — the work happened, even if the UI was off.
+- **A second ratatoist instance picks up the running session.** Every main-loop tick reconciles in-memory state against `pomodoro_session.json`. If instance A starts a pomodoro, instance B (already running on the same machine) adopts the session on its next tick and shows the toaster with the correct countdown. Cancellation in either instance deletes the file, and the other instance clears its in-memory state silently on the following tick (no duplicate `pomodoro_cancel` event). Natural completion is best-effort coordinated: in the rare race where both instances tick past 25:00 simultaneously, both award a tomato and emit a `pomodoro_complete` event — `tomato_count` ends up correct (last writer wins on `ui_settings.json` with the same incremented value), but the events log may carry a duplicate row. Per-session task lists in the toaster are *not* shared — each instance shows the completions that happened in its own process.
 
 ## Display
 
@@ -39,8 +40,8 @@ A single-slot 25-minute pomodoro timer paired with a tomato counter. Hitting `p`
 ## Persistence
 
 - `tomato_count: u64` and `tomato_date: YYYY-MM-DD` are stored in `ui_settings.json`, next to the Star Jar's keys.
-- The running-state (`pomodoro_started_at`) is deliberately not persisted. Session-scoped only.
-- `pomodoro_running` / `pomodoro_remaining_secs` are derived from the `Instant` at render time; no need to write either to disk.
+- **Running-session state lives in `<config_dir>/pomodoro_session.json`** (next to `ui_settings.json`). Shape: `{"session_id": "<RFC3339 of start>", "started_at": <unix epoch seconds>}`. The file exists exactly when a session is running; it is created on `toggle_pomodoro` start, removed on cancel, and removed on natural completion. Ephemeral mode skips both the read and the write, like every other on-disk artifact.
+- `pomodoro_remaining` is computed at render time from wall-clock (`now - started_at`), so it survives process restarts and is identical across instances reading the same file.
 - **Every pomodoro start / complete / cancel also appends a timestamped line to the events log** (see [events-log.spec.md](events-log.spec.md)). Each of those three lines carries a `session_id` — the RFC 3339 timestamp of the pomodoro's start, used as a stable session identifier. The running count for today is still the in-memory `tomato_count`; the log is for cross-day retrospective stats (cancellation rate, time-of-day patterns, weekly totals).
 - **Task completions during the session carry the same `session_id`** on their `task_complete` event (under the key `pomodoro_session_id`). This is how the pomodoro→tasks association is persisted: a future stats reader joins `task_complete` records to their parent pomodoro by matching `pomodoro_session_id` against the `session_id` on a `pomodoro_start`/`pomodoro_complete` pair. Completions outside a pomodoro simply don't carry the field.
 
@@ -49,7 +50,6 @@ A single-slot 25-minute pomodoro timer paired with a tomato counter. Hitting `p`
 - Configurable durations.
 - Breaks — short (5 min) or long (after 4 tomatoes).
 - Notifications, sounds, or system bell on completion.
-- Carrying the timer across app restarts.
 - A history view ("tomatoes earned last week"), streaks, or weekly totals.
 - Linking a tomato to the specific task you were working on.
 - Per-project pomodoro counters.

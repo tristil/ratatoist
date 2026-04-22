@@ -3994,7 +3994,7 @@ async fn fetch_jira_cards() -> Result<Vec<JiraCard>> {
             "workitem",
             "search",
             "--jql",
-            "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
+            "assignee = currentUser() AND statusCategory != Done AND status != Backlog ORDER BY updated DESC",
             "--fields",
             "key,summary,status,priority,issuetype",
             "--limit",

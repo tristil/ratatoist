@@ -10,11 +10,11 @@ A virtual sidebar entry below Pull Requests that lists open Jira work items assi
 - Backed by:
   ```
   acli jira workitem search \
-    --jql "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC" \
+    --jql "assignee = currentUser() AND statusCategory != Done AND status != Backlog ORDER BY updated DESC" \
     --fields key,summary,status,priority,issuetype \
     --limit 100 --json
   ```
-  No token is stored in ratatoist; it uses whatever `acli jira auth login` has configured.
+  Backlog cards are filtered at the JQL layer rather than client-side — the view is for cards that are actually in flight or queued for active work, not the long tail of unprioritized items. No token is stored in ratatoist; it uses whatever `acli jira auth login` has configured.
 - Fetch runs at app startup and then **polls in the background every `jira_cards_poll_interval_secs` seconds** (default **10s**, minimum 5s). Idle-gated: if the user is idle past `idle_timeout_secs`, the poll is deferred and fires on their next keystroke. Manual `r` still triggers an immediate fetch.
 - Loading / error / empty states render in the pane:
   - **Loading:** "Fetching Jira cards…"

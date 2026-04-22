@@ -137,7 +137,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
             }
 
             ProjectEntry::AgendaView => {
-                let count = app.agenda_events.len();
+                let count = app.visible_agenda_event_indices().len();
                 let mut spans = vec![
                     Span::raw("  "),
                     Span::styled("◷ ", Style::default().fg(Color::Green)),

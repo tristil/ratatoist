@@ -799,12 +799,17 @@ fn move_in_pane(app: &mut App, delta: i32) -> KeyAction {
                 return KeyAction::Consumed;
             }
             if app.agenda_view_active {
-                let len = app.agenda_events.len();
+                let visible = app.visible_agenda_event_indices();
+                let len = visible.len();
                 if len == 0 {
                     return KeyAction::Consumed;
                 }
-                let current = app.selected_agenda_item as i32;
-                app.selected_agenda_item = (current + delta).rem_euclid(len as i32) as usize;
+                let current_pos = visible
+                    .iter()
+                    .position(|i| *i == app.selected_agenda_item)
+                    .unwrap_or(0) as i32;
+                let new_pos = (current_pos + delta).rem_euclid(len as i32) as usize;
+                app.selected_agenda_item = visible[new_pos];
                 return KeyAction::Consumed;
             }
             if app.is_pr_view_active() {

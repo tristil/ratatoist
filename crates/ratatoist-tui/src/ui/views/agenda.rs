@@ -72,7 +72,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
         return;
     }
 
-    if app.agenda_events.is_empty() {
+    let visible_indices = app.visible_agenda_event_indices();
+    if visible_indices.is_empty() {
         let lines = vec![
             ListItem::new(Line::default()),
             ListItem::new(Line::from(Span::styled(
@@ -85,9 +86,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
     }
 
     // Pad the time column to the widest label so summaries line up.
-    let time_col_width = app
-        .agenda_events
+    let time_col_width = visible_indices
         .iter()
+        .filter_map(|i| app.agenda_events.get(*i))
         .map(|e| format_time_range(e).chars().count())
         .max()
         .unwrap_or(8)
@@ -96,9 +97,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
     // Only surface the calendar-name chip when more than one calendar is
     // represented in today's list. If every event is from the same
     // calendar, the chip is redundant noise.
-    let distinct_calendars: std::collections::HashSet<&str> = app
-        .agenda_events
+    let distinct_calendars: std::collections::HashSet<&str> = visible_indices
         .iter()
+        .filter_map(|i| app.agenda_events.get(*i))
         .map(|e| e.calendar_name.as_str())
         .filter(|n| !n.is_empty())
         .collect();
@@ -107,7 +108,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
     let mut items: Vec<ListItem> = Vec::new();
     let mut visual_selected: Option<usize> = None;
 
-    for (idx, event) in app.agenda_events.iter().enumerate() {
+    for raw_idx in &visible_indices {
+        let Some(event) = app.agenda_events.get(*raw_idx) else {
+            continue;
+        };
         let mut spans = vec![Span::styled("  ", theme.muted_text())];
         let time = format_time_range(event);
         let pad = time_col_width.saturating_sub(time.chars().count());
@@ -127,7 +131,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect, is_active: bool) {
             ));
         }
 
-        if idx == app.selected_agenda_item {
+        if *raw_idx == app.selected_agenda_item {
             visual_selected = Some(items.len());
         }
         items.push(ListItem::new(Line::from(spans)));

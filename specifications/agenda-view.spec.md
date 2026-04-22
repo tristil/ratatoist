@@ -26,6 +26,7 @@ A virtual sidebar entry below Jira Cards that lists today's events blended acros
 - **Partial failures are non-fatal.** If enumerating calendars fails, the whole fetch errors. If individual per-calendar event fetches fail, successful ones still render and failures are logged; only when *every* calendar errors is the view put in the error state.
 - Fetch runs at app startup and then **polls in the background every `agenda_poll_interval_secs` seconds** (default **300s**, minimum 30s). Calendars change slowly compared to tasks and PRs; a 5-minute cadence stays well under the Calendar API quota without feeling stale. Idle-gated: if the user is idle past `idle_timeout_secs`, the poll is deferred and fires on their next keystroke.
 - Cancelled instances of recurring events (API status `cancelled`) are filtered out before render.
+- **Past events are hidden as the day progresses.** A timed event whose end time is at or before the current local time is filtered out at render time (not at fetch time, so the list shrinks live without re-fetching). Currently-running events stay visible until they end. All-day events are not filtered — they apply to the whole day. Hiding applies to the focused Agenda view, the All-view Agenda section, and the sidebar count badge.
 - Loading / error / empty states render in the pane:
   - **Loading:** "Fetching today's agenda…"
   - **Error:** stderr from gws is surfaced, with a hint to run `gws auth login` if unauthenticated.

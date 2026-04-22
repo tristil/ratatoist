@@ -1820,9 +1820,7 @@ impl App {
                     match result {
                         Ok(events) => {
                             self.agenda_events = events;
-                            self.selected_agenda_item = self
-                                .selected_agenda_item
-                                .min(self.agenda_events.len().saturating_sub(1));
+                            self.clamp_selected_agenda_item();
                             self.agenda_error = None;
                         }
                         Err(e) => {
@@ -1943,6 +1941,31 @@ impl App {
         self.selected_all_item = 0;
     }
 
+    /// Raw indices into `agenda_events` whose end time is still in the
+    /// future (or that are all-day events). Past timed events drop out as
+    /// the day progresses without a re-fetch — the filter runs at read
+    /// time. All-day events are kept for the whole day.
+    pub fn visible_agenda_event_indices(&self) -> Vec<usize> {
+        let now = chrono::Local::now();
+        self.agenda_events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                if e.all_day {
+                    return true;
+                }
+                match chrono::DateTime::parse_from_rfc3339(&e.end) {
+                    Ok(end) => end.with_timezone(&chrono::Local) > now,
+                    // Unparseable end → keep the row visible rather than
+                    // silently dropping it. Same defensive default as the
+                    // time formatter.
+                    Err(_) => true,
+                }
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Build the combined item list for the All view. Today's calendar
     /// events first (they're time-bound and the most time-sensitive thing
     /// on the list), then Today tasks, then non-hidden PRs, then Jira
@@ -1952,7 +1975,9 @@ impl App {
         let mut items = Vec::new();
 
         // Today's agenda events, in the order the API returned (startTime).
-        for (i, _) in self.agenda_events.iter().enumerate() {
+        // Past events filtered out at read time so the All view shrinks
+        // live as the day progresses.
+        for i in self.visible_agenda_event_indices() {
             items.push(AllViewItem::AgendaEvent(i));
         }
 
@@ -2203,6 +2228,21 @@ impl App {
     pub fn refresh_agenda(&mut self) {
         if self.agenda_view_active {
             self.spawn_agenda_fetch();
+        }
+    }
+
+    /// Clamp `selected_agenda_item` so it points at one of the currently
+    /// visible (non-past) events, or 0 when the visible list is empty.
+    /// Run after the visible set may have shrunk — fetch landing or
+    /// navigation that crossed an event boundary.
+    pub fn clamp_selected_agenda_item(&mut self) {
+        let visible = self.visible_agenda_event_indices();
+        if visible.is_empty() {
+            self.selected_agenda_item = 0;
+            return;
+        }
+        if !visible.contains(&self.selected_agenda_item) {
+            self.selected_agenda_item = visible[0];
         }
     }
 
@@ -4106,6 +4146,16 @@ mod tests {
         app
     }
 
+    /// Build an RFC3339 local timestamp `hours` hours from now. Agenda
+    /// tests use this so events stay in the future regardless of when
+    /// the suite runs — the visible-events filter drops past timed
+    /// events, so hard-coded dates would rot the suite over time.
+    fn future_iso(hours: i64) -> String {
+        use chrono::SecondsFormat;
+        (chrono::Local::now() + chrono::Duration::hours(hours))
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
     /// Dispatch a key event through the same routing the main loop uses.
     fn press(app: &mut App, code: KeyCode) {
         let key = KeyEvent::new(code, KeyModifiers::NONE);
@@ -4269,8 +4319,8 @@ mod tests {
         });
         app.agenda_events.push(CalendarEvent {
             summary: "Standup".to_string(),
-            start: "2026-04-18T09:00:00-04:00".to_string(),
-            end: "2026-04-18T09:30:00-04:00".to_string(),
+            start: future_iso(1),
+            end: future_iso(2),
             all_day: false,
             location: String::new(),
             html_link: String::new(),
@@ -4948,8 +4998,8 @@ mod tests {
         });
         app.agenda_events.push(CalendarEvent {
             summary: "Standup".to_string(),
-            start: "2026-04-17T09:00:00-04:00".to_string(),
-            end: "2026-04-17T09:30:00-04:00".to_string(),
+            start: future_iso(1),
+            end: future_iso(2),
             all_day: false,
             location: String::new(),
             html_link: "https://calendar.google.com/event?eid=abc".to_string(),
@@ -4957,8 +5007,8 @@ mod tests {
         });
         app.agenda_events.push(CalendarEvent {
             summary: "Dentist".to_string(),
-            start: "2026-04-17T14:00:00-04:00".to_string(),
-            end: "2026-04-17T15:00:00-04:00".to_string(),
+            start: future_iso(3),
+            end: future_iso(4),
             all_day: false,
             location: "Main St.".to_string(),
             html_link: "https://calendar.google.com/event?eid=def".to_string(),
@@ -4971,6 +5021,50 @@ mod tests {
         assert!(matches!(items[0], AllViewItem::AgendaEvent(0)));
         assert!(matches!(items[1], AllViewItem::AgendaEvent(1)));
         assert!(matches!(items[2], AllViewItem::Task(_)));
+    }
+
+    /// `visible_agenda_event_indices` drops timed events whose end is in
+    /// the past, keeps timed events still in progress, and keeps all-day
+    /// events for the whole day. Past events shrinking the list is what
+    /// the agenda-view "filter past events" behavior is built on.
+    #[test]
+    fn visible_agenda_indices_drops_past_timed_events() {
+        let mut app = test_app();
+        // Past timed event — already over.
+        app.agenda_events.push(CalendarEvent {
+            summary: "Old standup".to_string(),
+            start: future_iso(-3),
+            end: future_iso(-2),
+            all_day: false,
+            ..CalendarEvent::default()
+        });
+        // In-progress timed event — started in the past, ends in the future.
+        app.agenda_events.push(CalendarEvent {
+            summary: "Now meeting".to_string(),
+            start: future_iso(-1),
+            end: future_iso(1),
+            all_day: false,
+            ..CalendarEvent::default()
+        });
+        // Future timed event.
+        app.agenda_events.push(CalendarEvent {
+            summary: "Later".to_string(),
+            start: future_iso(2),
+            end: future_iso(3),
+            all_day: false,
+            ..CalendarEvent::default()
+        });
+        // All-day event — kept regardless of clock time.
+        app.agenda_events.push(CalendarEvent {
+            summary: "Holiday".to_string(),
+            start: crate::ui::dates::today_str(),
+            end: crate::ui::dates::today_str(),
+            all_day: true,
+            ..CalendarEvent::default()
+        });
+
+        let visible = app.visible_agenda_event_indices();
+        assert_eq!(visible, vec![1, 2, 3], "drop past, keep in-progress, future, all-day");
     }
 
     /// With `gws_available = true` the Agenda sidebar entry appears under

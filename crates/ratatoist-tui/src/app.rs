@@ -3941,78 +3941,27 @@ fn collect_project_subtree(parent_id: Option<&str>, all: &[Project], out: &mut V
     }
 }
 
-/// Run two `gh search prs` queries in parallel — one for PRs I authored, one
-/// for PRs assigned to me — merge the results, dedup by URL, then make one
-/// GraphQL call to fold in CI rollup state. GitHub search's flag-based
-/// qualifiers are ANDed, so capturing both relationships needs two calls.
-/// Errors from either search query are surfaced; partial success (one query
-/// fails, one succeeds) is treated as a failure so the user sees the problem
-/// rather than a silently truncated list. The check-status call is
-/// best-effort — if it fails the PRs are still returned with
-/// `check_status: None`.
+/// Fetch open PRs authored by the viewer using a single GraphQL call that
+/// also returns CI rollup state per PR. `gh search prs` relies on GitHub's
+/// search index, which doesn't reliably cover private repos; the
+/// `viewer { pullRequests }` field uses the REST-backed viewer context and
+/// returns everything the token can see.
 async fn fetch_github_prs() -> Result<Vec<PullRequest>> {
-    let (authored, assigned) = tokio::try_join!(
-        fetch_github_prs_with_flag("--author"),
-        fetch_github_prs_with_flag("--assignee"),
-    )?;
-
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut merged: Vec<PullRequest> = Vec::with_capacity(authored.len() + assigned.len());
-    for pr in authored.into_iter().chain(assigned.into_iter()) {
-        if seen.insert(pr.url.clone()) {
-            merged.push(pr);
-        }
-    }
-
-    match fetch_pr_check_statuses(&merged).await {
-        Ok(statuses) => {
-            for pr in &mut merged {
-                if let Some(s) = statuses.get(&pr.node_id) {
-                    pr.check_status = Some(*s);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "pr check-status fetch failed; rendering without it");
-        }
-    }
-
-    Ok(merged)
-}
-
-/// Batch-fetch `statusCheckRollup.state` for a set of PRs in a single
-/// GraphQL request using aliased `node(id:…)` lookups. Returns a map from
-/// node ID to `CheckStatus`; PRs without rollup state (no checks
-/// configured, or no commits yet) are simply omitted. One API call
-/// regardless of PR count.
-async fn fetch_pr_check_statuses(
-    prs: &[PullRequest],
-) -> Result<std::collections::HashMap<String, CheckStatus>> {
     use tokio::process::Command;
 
-    let ids: Vec<&str> = prs
-        .iter()
-        .map(|pr| pr.node_id.as_str())
-        .filter(|id| !id.is_empty())
-        .collect();
-    if ids.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    // Build `n0: node(id:"..."){...F} n1: node(id:"..."){...F} ...` so we
-    // can correlate each rollup back to its PR by alias index.
-    let mut selections = String::new();
-    for (i, id) in ids.iter().enumerate() {
-        // GitHub node IDs are safe ASCII; still escape quotes defensively.
-        let esc = id.replace('\\', "\\\\").replace('"', "\\\"");
-        selections.push_str(&format!("n{i}: node(id: \"{esc}\") {{ ...S }} "));
-    }
-    let query = format!(
-        "query {{ {selections} }} \
-         fragment S on PullRequest {{ \
-           commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} \
-         }}"
-    );
+    // Fetch up to 100 open PRs in one GraphQL call.  `commits(last: 1)` gives
+    // us the head commit's statusCheckRollup so we don't need a second round-
+    // trip for check statuses.
+    let query = "\
+        { viewer { pullRequests(first: 100, states: OPEN) { \
+          nodes { \
+            id number title url isDraft updatedAt \
+            author { login } \
+            repository { nameWithOwner isArchived } \
+            commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } \
+          } \
+          pageInfo { hasNextPage } \
+        } } }";
 
     let output = Command::new("gh")
         .args(["api", "graphql", "-f"])
@@ -4033,78 +3982,19 @@ async fn fetch_pr_check_statuses(
 
     let raw: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| anyhow::anyhow!("graphql JSON parse error: {e}"))?;
-    let data = &raw["data"];
 
-    let mut out = std::collections::HashMap::new();
-    for (i, id) in ids.iter().enumerate() {
-        let state = data[format!("n{i}")]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
-            ["state"]
-            .as_str();
-        if let Some(status) = state.and_then(parse_check_state) {
-            out.insert((*id).to_string(), status);
-        }
-    }
-    Ok(out)
-}
-
-/// Map GitHub's `StatusState` enum string to our collapsed `CheckStatus`.
-/// `EXPECTED` (required check not yet reported) folds into `Pending` — to
-/// the user they're both "waiting."
-fn parse_check_state(s: &str) -> Option<CheckStatus> {
-    match s {
-        "SUCCESS" => Some(CheckStatus::Success),
-        "FAILURE" | "ERROR" => Some(CheckStatus::Failure),
-        "PENDING" | "EXPECTED" => Some(CheckStatus::Pending),
-        _ => None,
-    }
-}
-
-/// Shell out to `gh search prs <flag> @me --state open --json ...` and parse
-/// the JSON array into `PullRequest` records. `flag` is `--author` or
-/// `--assignee`; the rest of the query is identical.
-async fn fetch_github_prs_with_flag(flag: &str) -> Result<Vec<PullRequest>> {
-    use tokio::process::Command;
-
-    let output = Command::new("gh")
-        .args([
-            "search",
-            "prs",
-            flag,
-            "@me",
-            "--state",
-            "open",
-            // Exclude PRs in archived repos — they can't be merged or closed,
-            // so they're permanent noise in this view.
-            "--archived=false",
-            "--limit",
-            "100",
-            "--json",
-            "id,number,title,url,repository,author,updatedAt,isDraft",
-        ])
-        .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to invoke gh: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let msg = if stderr.is_empty() {
-            format!("gh exited with status {}", output.status)
-        } else {
-            stderr
-        };
-        return Err(anyhow::anyhow!("{msg}"));
-    }
-
-    let raw: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| anyhow::anyhow!("gh JSON parse error: {e}"))?;
-
-    let arr = raw
+    let nodes = &raw["data"]["viewer"]["pullRequests"]["nodes"];
+    let arr = nodes
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("expected JSON array from gh"))?;
+        .ok_or_else(|| anyhow::anyhow!("unexpected GraphQL response shape"))?;
 
     let mut prs = Vec::with_capacity(arr.len());
     for item in arr {
+        // Skip PRs in archived repos — they can't be merged or closed.
+        if item["repository"]["isArchived"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let state = item["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"].as_str();
         prs.push(PullRequest {
             number: item["number"].as_u64().unwrap_or(0),
             title: item["title"].as_str().unwrap_or("").to_string(),
@@ -4117,10 +4007,22 @@ async fn fetch_github_prs_with_flag(flag: &str) -> Result<Vec<PullRequest>> {
             updated_at: item["updatedAt"].as_str().unwrap_or("").to_string(),
             is_draft: item["isDraft"].as_bool().unwrap_or(false),
             node_id: item["id"].as_str().unwrap_or("").to_string(),
-            check_status: None,
+            check_status: state.and_then(parse_check_state),
         });
     }
     Ok(prs)
+}
+
+/// Map GitHub's `StatusState` enum string to our collapsed `CheckStatus`.
+/// `EXPECTED` (required check not yet reported) folds into `Pending` — to
+/// the user they're both "waiting."
+fn parse_check_state(s: &str) -> Option<CheckStatus> {
+    match s {
+        "SUCCESS" => Some(CheckStatus::Success),
+        "FAILURE" | "ERROR" => Some(CheckStatus::Failure),
+        "PENDING" | "EXPECTED" => Some(CheckStatus::Pending),
+        _ => None,
+    }
 }
 
 /// Shell out to `acli jira workitem search` and parse the JSON output into

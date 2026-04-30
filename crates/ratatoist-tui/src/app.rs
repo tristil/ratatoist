@@ -12,11 +12,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use ratatoist_core::api::client::TodoistClient;
-use ratatoist_core::api::models::{Comment, Folder, Label, Project, Section, Task, Workspace};
+use ratatoist_core::api::models::{Comment, Due, Folder, Label, Project, Section, Task, Workspace};
 use ratatoist_core::api::sync::{SyncCommand, SyncRequest, SyncResponse};
 use ratatoist_core::sync_state::SyncState;
 
-use crate::keys::{self, KeyAction};
+use crate::keys::{self, DeferTarget, KeyAction};
 use crate::ui;
 
 static CMD_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1620,6 +1620,8 @@ impl App {
                     KeyAction::CloseAllFolds => self.close_all_folds(),
                     KeyAction::CompleteTask => self.complete_selected_task(),
                     KeyAction::CompleteTaskById(id) => self.complete_task_by_id(id),
+                    KeyAction::DeferSelected(target) => self.defer_selected_task(target),
+                    KeyAction::DeferTaskById(id, target) => self.defer_task_by_id(id, target),
                     KeyAction::OpenDetailById(id) => self.open_detail_for(id),
                     KeyAction::OpenPriorityPicker => {
                         if let Some(task) = self.selected_task() {
@@ -2683,6 +2685,97 @@ impl App {
             self.selected_all_item = new_len - 1;
         }
         self.flush_commands();
+    }
+
+    fn defer_selected_task(&mut self, target: DeferTarget) {
+        let task_id = {
+            let visible = self.visible_tasks();
+            let Some(task) = visible.get(self.selected_task) else {
+                return;
+            };
+            task.id.clone()
+        };
+        self.enqueue_defer_task_by_id(task_id, target);
+        let new_len = self.visible_tasks().len();
+        if new_len > 0 && self.selected_task >= new_len {
+            self.selected_task = new_len - 1;
+        }
+        self.flush_commands();
+    }
+
+    fn defer_task_by_id(&mut self, task_id: String, target: DeferTarget) {
+        self.enqueue_defer_task_by_id(task_id, target);
+        let new_len = self.all_view_items().len();
+        if new_len > 0 && self.selected_all_item >= new_len {
+            self.selected_all_item = new_len - 1;
+        }
+        self.flush_commands();
+    }
+
+    /// Build the `item_update` command for a defer + apply the optimistic
+    /// piece. Split out so tests can inspect the enqueued command without
+    /// flushing.
+    ///
+    /// Tomorrow shifts the task's local due date forward one day so the Today
+    /// view filters it out immediately. Evening adds the `evening` label —
+    /// the today / all-view evening-label filter then hides the task until
+    /// 17:00 local time. Already-tagged tasks short-circuit so `e` doesn't
+    /// produce a redundant network round trip.
+    fn enqueue_defer_task_by_id(&mut self, task_id: String, target: DeferTarget) {
+        let Some(before) = self.tasks.iter().find(|t| t.id == task_id).cloned() else {
+            return;
+        };
+
+        let args: serde_json::Value = match target {
+            DeferTarget::Tomorrow => {
+                let tomorrow = crate::ui::dates::offset_days_str(1);
+                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                    match &mut t.due {
+                        Some(due) => {
+                            due.date = tomorrow.clone();
+                            due.datetime = None;
+                            due.is_recurring = false;
+                            due.string = Some("tomorrow".to_string());
+                        }
+                        None => {
+                            t.due = Some(Due {
+                                date: tomorrow.clone(),
+                                is_recurring: false,
+                                string: Some("tomorrow".to_string()),
+                                ..Due::default()
+                            });
+                        }
+                    }
+                }
+                serde_json::json!({ "id": task_id, "due": { "string": "tomorrow" } })
+            }
+            DeferTarget::Evening => {
+                if before.labels.iter().any(|l| l == "evening") {
+                    return;
+                }
+                let mut new_labels = before.labels.clone();
+                new_labels.push("evening".to_string());
+                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                    t.labels = new_labels.clone();
+                }
+                serde_json::json!({ "id": task_id, "labels": new_labels })
+            }
+        };
+
+        let uuid = new_uuid();
+        self.pending_commands.push(SyncCommand {
+            r#type: "item_update".to_string(),
+            temp_id: None,
+            uuid: uuid.clone(),
+            args,
+        });
+        self.temp_id_pending.insert(
+            uuid,
+            OptimisticOp::TaskUpdated {
+                task_id,
+                before,
+            },
+        );
     }
 
     /// Enqueue the complete/reopen command for the selected task and apply
@@ -4544,6 +4637,8 @@ mod tests {
             KeyAction::FormEscNormal => app.submit_input(),
             KeyAction::CancelInput => app.cancel_input(),
             KeyAction::CompleteTaskById(id) => app.complete_task_by_id(id),
+            KeyAction::DeferSelected(target) => app.defer_selected_task(target),
+            KeyAction::DeferTaskById(id, target) => app.defer_task_by_id(id, target),
             KeyAction::OpenDetailById(id) => app.open_detail_for(id),
             KeyAction::TogglePomodoro => app.toggle_pomodoro(),
             KeyAction::Consumed | KeyAction::None => {}
@@ -5972,5 +6067,123 @@ mod tests {
         let obj = parsed.as_object().expect("object");
         assert_eq!(obj.len(), 2, "ts + kind only");
         assert_eq!(parsed["kind"], "pomodoro_start");
+    }
+
+    /// Pressing `t` on a Today-view task shifts its due date to tomorrow
+    /// optimistically (so it leaves Today immediately) and enqueues an
+    /// `item_update` with `due: { string: "tomorrow" }`.
+    #[test]
+    fn defer_tomorrow_shifts_due_date_and_sends_item_update() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        let today = crate::ui::dates::today_str();
+        app.tasks.push(Task {
+            id: "t1".to_string(),
+            content: "Write memo".to_string(),
+            project_id: "p1".to_string(),
+            due: Some(Due {
+                date: today,
+                is_recurring: false,
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.activate_today_view();
+        app.active_pane = Pane::Tasks;
+        app.selected_task = 0;
+        assert_eq!(app.visible_tasks().len(), 1);
+
+        app.enqueue_defer_task_by_id("t1".to_string(), DeferTarget::Tomorrow);
+
+        let tomorrow = crate::ui::dates::offset_days_str(1);
+        assert_eq!(
+            app.tasks[0].due.as_ref().expect("due").date,
+            tomorrow,
+            "due date shifts forward optimistically"
+        );
+        assert_eq!(
+            app.visible_tasks().len(),
+            0,
+            "task leaves Today after defer-to-tomorrow"
+        );
+        let cmd = app.pending_commands.last().expect("enqueued command");
+        assert_eq!(cmd.r#type, "item_update");
+        assert_eq!(cmd.args["id"], "t1");
+        assert_eq!(cmd.args["due"]["string"], "tomorrow");
+    }
+
+    /// Pressing `e` adds the `evening` label to the task and enqueues an
+    /// `item_update` carrying the full new labels array. The today-view
+    /// evening filter then hides the task until 17:00 — verified separately
+    /// in dates::tests::evening_label_hidden_before_5pm_and_visible_after.
+    #[test]
+    fn defer_evening_adds_label_and_sends_item_update() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.tasks.push(Task {
+            id: "t1".to_string(),
+            content: "Read article".to_string(),
+            project_id: "p1".to_string(),
+            labels: vec!["focus".to_string()],
+            due: Some(Due {
+                date: crate::ui::dates::today_str(),
+                ..Due::default()
+            }),
+            ..Task::default()
+        });
+        app.active_pane = Pane::Tasks;
+        app.selected_task = 0;
+
+        app.enqueue_defer_task_by_id("t1".to_string(), DeferTarget::Evening);
+
+        assert_eq!(
+            app.tasks[0].labels,
+            vec!["focus".to_string(), "evening".to_string()],
+            "evening label appended without dropping existing labels"
+        );
+        let cmd = app.pending_commands.last().expect("enqueued command");
+        assert_eq!(cmd.r#type, "item_update");
+        assert_eq!(cmd.args["id"], "t1");
+        assert_eq!(
+            cmd.args["labels"],
+            serde_json::json!(["focus", "evening"])
+        );
+    }
+
+    /// `e` on a task already labeled `evening` is a no-op — no redundant
+    /// network round trip and no duplicate label entry.
+    #[test]
+    fn defer_evening_is_noop_when_already_labeled() {
+        let mut app = test_app();
+        app.projects.push(Project {
+            id: "p1".to_string(),
+            name: "Work".to_string(),
+            ..Project::default()
+        });
+        app.tasks.push(Task {
+            id: "t1".to_string(),
+            content: "Read article".to_string(),
+            project_id: "p1".to_string(),
+            labels: vec!["evening".to_string()],
+            ..Task::default()
+        });
+        app.active_pane = Pane::Tasks;
+        app.selected_task = 0;
+
+        app.enqueue_defer_task_by_id("t1".to_string(), DeferTarget::Evening);
+
+        assert_eq!(app.tasks[0].labels, vec!["evening".to_string()]);
+        assert!(
+            app.pending_commands.is_empty(),
+            "no command enqueued when already deferred to evening"
+        );
     }
 }

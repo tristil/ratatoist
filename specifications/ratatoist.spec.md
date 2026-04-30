@@ -23,6 +23,7 @@ A terminal UI client for Todoist. Lets users manage their tasks without leaving 
 ## Task Management
 
 - Complete / uncomplete (`x`) with optimistic UI — instant feedback, reverts on server error. All completes send `item_close` (mirrors the Todoist UI: recurring tasks advance to the next occurrence, non-recurring close normally). Recurring tasks skip the optimistic `checked` flip so they stay visible while the server advances the due date.
+- Defer (`t` → tomorrow, `e` → evening) — both send `item_update` with an optimistic local update that reverts on server error. `t` shifts the due date to tomorrow (the task disappears from Today). `e` adds the `evening` label to the task; the existing Today / All-view filter hides `evening`-labeled tasks until 17:00 local time, so the task disappears from the daytime planning view and reappears at 5 PM. If the task already carries the `evening` label, `e` is a no-op.
 - Quick-add (`a`) with content, priority, due date, and project fields.
 - Inline field editing from the detail pane.
 - Priority picker popup.

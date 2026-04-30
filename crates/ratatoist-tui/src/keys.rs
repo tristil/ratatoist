@@ -29,6 +29,26 @@ fn retreat_into_stats_or_wrap(app: &mut App) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferTarget {
+    Tomorrow,
+    Evening,
+}
+
+/// Resolve the All view's selected task → `DeferTaskById` action. Mirrors
+/// the `x` All-view path: `selected_task` doesn't index into `visible_tasks()`
+/// here because the All view's task list spans projects.
+fn defer_in_all_view(app: &mut App, target: DeferTarget) -> KeyAction {
+    let items = app.all_view_items();
+    if let Some(crate::app::AllViewItem::Task(i)) = items.get(app.selected_all_item)
+        && let Some(task) = app.tasks.get(*i)
+    {
+        KeyAction::DeferTaskById(task.id.clone(), target)
+    } else {
+        KeyAction::Consumed
+    }
+}
+
 pub enum KeyAction {
     Quit,
     ProjectChanged,
@@ -43,6 +63,8 @@ pub enum KeyAction {
     CloseAllFolds,
     CompleteTask,
     CompleteTaskById(String),
+    DeferSelected(DeferTarget),
+    DeferTaskById(String, DeferTarget),
     OpenDetailById(String),
     #[allow(dead_code)]
     OpenPriorityPicker,
@@ -436,6 +458,18 @@ fn handle_vim_normal(app: &mut App, key: KeyEvent) -> KeyAction {
             }
         }
         KeyCode::Char('x') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CompleteTask,
+        KeyCode::Char('t') if matches!(app.active_pane, Pane::Tasks) && app.all_view_active => {
+            defer_in_all_view(app, DeferTarget::Tomorrow)
+        }
+        KeyCode::Char('t') if matches!(app.active_pane, Pane::Tasks) => {
+            KeyAction::DeferSelected(DeferTarget::Tomorrow)
+        }
+        KeyCode::Char('e') if matches!(app.active_pane, Pane::Tasks) && app.all_view_active => {
+            defer_in_all_view(app, DeferTarget::Evening)
+        }
+        KeyCode::Char('e') if matches!(app.active_pane, Pane::Tasks) => {
+            KeyAction::DeferSelected(DeferTarget::Evening)
+        }
         KeyCode::Char('a') if matches!(app.active_pane, Pane::Tasks) => KeyAction::StartInput,
         KeyCode::Char('f') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CycleFilter,
         KeyCode::Char('o') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CycleSort,
@@ -604,6 +638,18 @@ fn handle_standard(app: &mut App, key: KeyEvent) -> KeyAction {
             if matches!(app.active_pane, Pane::Projects | Pane::Tasks) =>
         {
             KeyAction::TogglePomodoro
+        }
+        KeyCode::Char('t') if matches!(app.active_pane, Pane::Tasks) && app.all_view_active => {
+            defer_in_all_view(app, DeferTarget::Tomorrow)
+        }
+        KeyCode::Char('t') if matches!(app.active_pane, Pane::Tasks) => {
+            KeyAction::DeferSelected(DeferTarget::Tomorrow)
+        }
+        KeyCode::Char('e') if matches!(app.active_pane, Pane::Tasks) && app.all_view_active => {
+            defer_in_all_view(app, DeferTarget::Evening)
+        }
+        KeyCode::Char('e') if matches!(app.active_pane, Pane::Tasks) => {
+            KeyAction::DeferSelected(DeferTarget::Evening)
         }
         KeyCode::Char('f') if matches!(app.active_pane, Pane::Tasks) => KeyAction::CycleFilter,
 

@@ -53,6 +53,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             ("j/k", "navigate"),
             ("Enter", "open/fold"),
             ("x", "complete"),
+            ("t/e", "defer"),
             ("a", "add"),
             ("f", "filter"),
             ("o", "sort"),

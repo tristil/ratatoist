@@ -17,6 +17,8 @@ The action triggered by a key depends on the type of the currently selected item
 |-----|--------------|------|-------------|-----------|
 | `Enter` | Open event in browser | Open detail pane | Open PR in browser | Open card in browser |
 | `x` | No-op | Complete task | No-op | No-op |
+| `t` | No-op | Defer task to tomorrow (shift due date) | No-op | No-op |
+| `e` | No-op | Tag task with `evening` label (hides until 17:00) | No-op | No-op |
 | `r` | Refresh all sources | Refresh all sources | Refresh all sources | Refresh all sources |
 | `a` | Open add modal (empty defaults) | Open add modal (due = `today`, project = Inbox — see [today-view-add.spec.md](today-view-add.spec.md)) | Open add modal (empty defaults) | Open add modal (empty defaults) |
 

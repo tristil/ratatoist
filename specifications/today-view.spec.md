@@ -10,6 +10,7 @@ A virtual sidebar entry below Inbox showing all overdue and due-today tasks acro
 - Today's tasks appear below, sorted by project then creation order.
 - Each task row shows its source project name.
 - Task completion (`x`) and detail pane (`Enter`) work the same as in any project.
+- Defer keys: `t` reschedules the selected task to tomorrow via an optimistic local date shift, so it leaves Today immediately. `e` adds the `evening` label to the selected task — the existing evening-label filter (above) hides it until 17:00, so the task vanishes from Today during the day and returns at 5 PM. If the task already has the `evening` label, `e` is a no-op. Both send `item_update` and revert on server error.
 - Empty state: "All caught up for today" when no tasks qualify.
 - Updates in real time as sync events arrive.
 
